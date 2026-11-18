@@ -84,7 +84,7 @@ f["LEGGIMI.txt"] = f"""BOUND (BoundHash) per BlackMiner F1 Ultra - pacchetto per
 =====================================================================
 
 Contenuto: bitstream bound, {cores} core BoundHash (uno scratchpad da 512 KiB per core, in block RAM) a {mhz} MHz:
-           {HPS:.0f} H/s per FPGA nominali, circa {HPS * 6 / 1000:.1f} kH/s per hash board da 6 FPGA, pochi W per FPGA;
+           {HPS:.0f} H/s per FPGA nominali, circa {HPS * 6 / 1000:.1f} kH/s per hash board da 6 FPGA, circa 50 W per hash board;
            bound-miner 1.1 (Stratum verso il ponte, ventole PWM, pagina Frequency con profili), bound-loadfpga.
            {nota}
 Questo pacchetto e' solo per la F1 Ultra (XC7K420T). Se la macchina ha FPGA di un altro tipo

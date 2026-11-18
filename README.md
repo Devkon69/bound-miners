@@ -6,7 +6,7 @@ solo on your own node:
 | Folder | What it is |
 |---|---|
 | `gpu/` | **bound-gpuminer**: CUDA miner for NVIDIA cards, Windows and Linux. About 348 kH/s on an RTX 4090. |
-| `fpga/` | Bitstream (Verilog), host miner **bound-miner** and packages for the **BlackMiner F1 Ultra** hash boards. About 42-50 kH/s and 30 W per hash board. |
+| `fpga/` | Bitstream (Verilog), host miner **bound-miner** and packages for the **BlackMiner F1 Ultra** hash boards. About 42-50 kH/s and 50 W per hash board. |
 | `bridge/` | **bound_bridge.py**: Stratum server for the miners, talks to your node (Python 3, no packages). |
 | `node/` | Patch for the BOUND node (`boundd`) that adds two RPC commands for external miners. |
 | `release/` | Ready-to-use binaries and packages built from this source. |
@@ -59,7 +59,7 @@ The benchmarks have no fee. The source is here: build with `-DDEVFEE_PERCENT=0` 
 | Hardware | Hashrate | Notes |
 |---|---|---|
 | RTX 4090 | 348 kH/s | measured, 8192 hashes in flight (4 GiB of VRAM), default settings |
-| BlackMiner F1 Ultra, one hash board (6 x XC7K420T) | 42-50 kH/s, ~30 W | timing closed at 90 MHz (41.7 kH/s nominal); runs up to 100 MHz in overclock (46.3 kH/s nominal); about 50 kH/s and 30 W reported on a real board |
+| BlackMiner F1 Ultra, one hash board (6 x XC7K420T) | 42-50 kH/s, ~50 W | timing closed at 90 MHz (41.7 kH/s nominal); runs up to 100 MHz in overclock (46.3 kH/s nominal); about 50 kH/s and 50 W reported on a real board |
 
 BoundHash moves about 2.1 MB of memory per hash (a 512 KiB scratchpad, 16,384 random 128-byte accesses), so the
 hashrate follows memory bandwidth: GPUs win by a wide margin. On the FPGA every core needs its own scratchpad in

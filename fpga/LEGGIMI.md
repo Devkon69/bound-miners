@@ -6,7 +6,7 @@ annuncio bitcointalk.org/index.php?topic=5600075.0. Proof of work proprio, **Bou
 moltiplicazione 64x64, SHA-256 all'inizio e alla fine. Blocchi da 10 minuti, 50 BOUND.
 
 **Stato (18/11/2026):** bitstream F1 Ultra compilato (7 core, timing chiuso a 90 MHz, WNS +0,158 ns) e provato in
-macchina con la BeagleBone: circa 50 kH/s e 30 W per hash board; in overclock regge fino a 100 MHz. Miner
+macchina con la BeagleBone: circa 50 kH/s e 50 W per hash board; in overclock regge fino a 100 MHz. Miner
 `bound-miner` 1.1 con dev fee 3 %, ponte e patch del nodo provati insieme su regtest. Pacchetti nella cartella
 `release/fpga-f1-ultra/`. Non ancora provati: pacchetto per l'interfaccia web, F2 e F1 Plus, mainnet a lungo.
 

@@ -136,11 +136,11 @@ Installazione (sulla BBB):
 
 Frequenze: /config/bound/freq.json (all'installazione "freq" {mstart}); bm-web > Frequenza: casella per chip,
 profili Giorno / Notte, cambio al volo senza fermare il miner. A 85 C l'FPGA si ferma da solo e riparte a 75 C.
-Il consumo e' basso (pochi W per FPGA): scendere di frequenza non serve, toglie solo hashrate.
+Il consumo e' contenuto (circa 50 W per hash board): scendere di frequenza non serve, toglie solo hashrate.
 bm-web 1.6: http://IP_BBB/ (scheda Miner: moneta BOUND). Log: journalctl -u bound -f.
 
 md5: bitstream {md(f["fpgaminer_top_bound.bit"])}, bound-miner {md(f["bound-miner"])}.
-Bitstream e miner 1.0 provati in macchina (18/11: circa 50 kH/s e 30 W per board); la 1.1
+Bitstream e miner 1.0 provati in macchina (18/11: circa 50 kH/s e 50 W per board); la 1.1
 aggiunge solo la dev fee. Nel bench guarda "6 FPGA" per board, "verified results" e "hardware errors";
 in mining "pool: job", "share accepted" ed eventuali "hardware error".
 """
