@@ -1,0 +1,45 @@
+bound-gpuminer 0.3 - miner CUDA per BOUND (BoundHash) - 18/11/2026
+==================================================================
+Miner GPU per Windows e Linux. Su una RTX 4090 il kernel fa 348,5 kH/s (misurati il 18/11 con bound-gpubench,
+8192 hash in volo e 128 thread per blocco: sono i default del miner).
+
+DEV FEE 3 % (dichiarata): 180 secondi ogni 100 minuti (la prima volta dopo 20 minuti) il miner lavora per
+l'indirizzo dello sviluppatore BW1chX39ABzxeVgHqqmTDGL5woHd6GAgj2rqVm4iw4Ty5fG7K1Y7: in quella finestra
+si presenta al tuo ponte con quell'indirizzo, quindi un blocco trovato in quei 180 s paga lui. Lo scrive
+all'avvio e a ogni finestra. Il bench non ha fee. Serve il ponte di questo repository (un indirizzo per miner).
+
+Cosa serve
+  - driver NVIDIA 550 o piu' recente (nessun CUDA Toolkit); scheda RTX 20 o piu' nuova, almeno 6 GB liberi;
+  - il nodo BOUND con la patch e il ponte accesi (cartelle node/ e bridge/ del repository, gli stessi del miner
+    FPGA). BOUND non ha pool: si mina in solitaria sul proprio nodo.
+
+Uso
+  1. prova a vuoto, senza ponte:      bench.bat            (20 secondi, stampa i kH/s)
+  2. mining: apri avvia.bat con il Blocco note, metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO
+     (e l'IP del ponte se non e' su questo PC), salva e fai doppio clic.
+     bound-gpuminer.exe --user B....pc1 --pool 127.0.0.1:7340
+  Se il ponte gira in WSL su questo stesso PC, 127.0.0.1:7340 di solito funziona; altrimenti usa l'IP del PC.
+
+Cosa si vede
+  ponte: collegato / autorizzato / difficolta' / blocco nuovo
+  ogni 10 s:  348.2 kH/s (media 347.9) | share N accettate (dev fee N), N rifiutate, N vecchie | errori GPU 0
+  Le share servono solo a misurare l'hashrate (una ogni 10 s circa). Il blocco trovato lo scrive il ponte:
+  *** BLOCCO N ACCETTATO.  "errori GPU" deve restare 0: ogni nonce e' ricalcolato sulla CPU prima di mandarlo.
+  Tutto finisce anche in bound-gpuminer.log.
+
+Opzioni
+  --gpu N          scheda (default 0; per piu' schede, per ora, un miner per scheda con --gpu diversi)
+  --batch N        hash in volo (default 8192 = 4 GiB di VRAM; sulla 4090 e' il valore migliore misurato)
+  --block N        thread per blocco (default 128)
+  --share-s S      secondi tra le share (default 10)
+  --bench S        solo la velocita'
+bound-gpubench.exe (bench_tabella.bat): la tabella completa hash in volo / thread per blocco, per tarare
+un'altra scheda; mandami bound-gpubench.log.
+
+Stato: kernel verificato bit a bit sulla CPU e provato su una RTX 4090 (hash uguali alla CPU, 348,5 kH/s).
+Il miner (rete, dev fee) e' provato da capo a fondo SENZA GPU: kernel sulla CPU, ponte vero, nodo regtest vero:
+blocchi accettati, blocchi della finestra di fee pagati all'indirizzo della fee, ricollegamento dopo la caduta
+del ponte. La parte di rete su Windows e la mainnet non sono ancora state provate.
+Linux: dist/bound-gpuminer (glibc 2.17 o piu' recente), stesse opzioni.
+
+Sorgenti: src/ (bound_kernel.cu, gpuminer.c, gpubench.c, gpu_common.h, bound_pow.c), tools/, build.sh.

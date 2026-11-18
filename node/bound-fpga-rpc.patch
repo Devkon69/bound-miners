@@ -1,0 +1,118 @@
+diff --git a/src/rpc/methods.cpp b/src/rpc/methods.cpp
+index 4f9990d..f4ce1ba 100644
+--- a/src/rpc/methods.cpp
++++ b/src/rpc/methods.cpp
+@@ -4,6 +4,7 @@
+ #include "core/consensus.h"
+ #include "core/miner.h"
+ #include "core/pow.h"
++#include "crypto/sha256.h"
+ #include "net/protocol.h"
+ #include "util/hex.h"
+ #include "util/serialize.h"
+@@ -14,6 +15,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <format>
++#include <memory>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+@@ -660,6 +662,97 @@ void register_node_methods(RpcTable& t, NodeContext& node) {
+               }
+               return hashes;
+           });
++    // bound-fpga: work for a miner outside the node (FPGA boards behind bound_bridge.py), and its
++    // solutions back. getminingwork hands out a template whose coinbase memo (the 8-byte extra
++    // nonce) is left to the miner; submitminingwork fills it in, checks the proof of work and, if
++    // it meets the network's target, submits the block like generatetoaddress does.
++    struct ExternalWork {
++        std::uint64_t id;
++        Block block;
++    };
++    const auto ext_work = std::make_shared<std::vector<ExternalWork>>();
++    const auto ext_next = std::make_shared<std::uint64_t>(1);
++    t.add("getminingwork", "<address>",
++          "A block template for an external miner, paying the address: header fields, the coinbase without its 8-byte "
++          "memo (the miner's extra nonce) and the merkle branch that joins the coinbase to the root.",
++          1, 1, [&node, block_budget, ext_work, ext_next](const RpcParams& p) -> json {
++              const ConsensusParams& params = node.chain.params();
++              const PublicKey payee = parse_address(p.str(0), params);
++              const auto now = static_cast<std::uint32_t>(node.clock());
++              std::optional<Block> tmpl = make_block_template(node.chain, payee, node.mempool.select(block_budget).txs, now);
++              if (!tmpl) tmpl = make_block_template(node.chain, payee, {}, now);
++              if (!tmpl) throw RpcError(rpc_error::kMisc, "no block template");
++              const Block& b = *tmpl;
++              Bytes coinbase = b.txs[0].serialize();  // ends with the memo: its length byte (8), then 8 bytes
++              coinbase.resize(coinbase.size() - 8);
++              std::vector<uint256> level;
++              for (const Transaction& tx : b.txs) level.push_back(tx.wtxid());
++              json branch = json::array();
++              while (level.size() > 1) {  // as merkle_root: pairs hashed, an odd last one carried up
++                  branch.push_back(to_hex(level[1].bytes()));
++                  std::vector<uint256> next;
++                  for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
++                      std::array<std::uint8_t, 64> pair;
++                      std::copy(level[i].bytes().begin(), level[i].bytes().end(), pair.begin());
++                      std::copy(level[i + 1].bytes().begin(), level[i + 1].bytes().end(), pair.begin() + 32);
++                      next.push_back(uint256(tagged_hash("BOUND/merkle", pair)));
++                  }
++                  if (level.size() % 2 == 1) next.push_back(level.back());
++                  level = std::move(next);
++              }
++              // keep the templates of this tip only, the last 256 of them
++              std::erase_if(*ext_work, [&](const ExternalWork& w) { return w.block.header.prev_hash != b.header.prev_hash; });
++              if (ext_work->size() >= 256) ext_work->erase(ext_work->begin());
++              const std::uint64_t id = (*ext_next)++;
++              ext_work->push_back(ExternalWork{id, b});
++              const std::optional<uint256> target = target_from_compact(b.header.bits);
++              return json{
++                  {"id", id},
++                  {"height", node.chain.height() + 1},
++                  {"version", b.header.version},
++                  {"prevhash", to_hex(b.header.prev_hash.bytes())},  // the 32 bytes as they are in the header
++                  {"time", b.header.time},
++                  {"bits", b.header.bits},
++                  {"target", target ? target->to_hex() : std::string()},  // most significant byte first
++                  {"coinbase", to_hex(coinbase)},
++                  {"memosize", 8},
++                  {"branch", branch},
++                  {"lines", params.pow_lines},
++                  {"transactions", b.txs.size()},
++              };
++          });
++    t.add("submitminingwork", "<id> <memo> <time> <nonce>",
++          "A solution to getminingwork's template `id`: the coinbase memo (16 hex digits), the header's time and nonce. "
++          "Returns the proof-of-work hash; the block is submitted if it meets the network's target.",
++          4, 4, [&node, ext_work](const RpcParams& p) -> json {
++              const ConsensusParams& params = node.chain.params();
++              const std::int64_t id = p.integer(0);
++              const auto it = std::find_if(ext_work->begin(), ext_work->end(),
++                                           [&](const ExternalWork& w) { return w.id == static_cast<std::uint64_t>(id); });
++              if (it == ext_work->end() || it->block.header.prev_hash != node.chain.tip().hash)
++                  return json{{"accepted", false}, {"stale", true}, {"reason", "stale work"}};
++              const std::optional<Bytes> memo = from_hex(p.str(1));
++              if (!memo || memo->size() != 8) throw RpcError(rpc_error::kInvalidParameter, "memo must be 8 bytes (16 hex digits)");
++              const std::int64_t time = p.integer(2), nonce = p.integer(3);
++              if (time < 0 || time > 0xffffffffLL || nonce < 0 || nonce > 0xffffffffLL)
++                  throw RpcError(rpc_error::kInvalidParameter, "time and nonce are 32-bit numbers");
++              Block block = it->block;
++              block.txs[0].memo = *memo;
++              block.header.merkle_root = block.compute_merkle_root();
++              block.header.time = static_cast<std::uint32_t>(time);
++              block.header.nonce = static_cast<std::uint32_t>(nonce);
++              const uint256 hash = pow_hash(block.header, params);
++              json out{{"powhash", hash.to_hex()}, {"stale", false}, {"accepted", false}};
++              if (!check_proof_of_work(hash, block.header.bits, params.pow_limit)) {
++                  out["reason"] = "above the network target";
++                  return out;
++              }
++              const bool ok = node.peers.submit_block(block, node.clock()).accepted();
++              out["accepted"] = ok;
++              out["block"] = block.hash().to_hex();
++              if (!ok) out["reason"] = "the block was rejected";
++              return out;
++          });
+     // Milestone 9: mining in the background, without blocking the node, switched on and off at will.
+     const auto mining_info = [&node] {
+         const ConsensusParams& params = node.chain.params();
