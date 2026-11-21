@@ -45,6 +45,12 @@ bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool IP_OF_THE_BRIDGE:7340
 - `bound-ultra-bbb-fee3.zip`: package for hash boards driven by a BeagleBone Black rev C.
 - `bound_f1u_7c_90m.bit`, `bound-miner-armv7-1.1-fee3`, `bound-loadfpga-armv7`: the single pieces.
 
+**3c. BlackMiner F2, F1 Plus, F1** (web-interface packages, same use as the F1 Ultra one; not tested on a machine yet):
+- `release/fpga-f2/upgrade_altcoin_F2_bound_90_fee3.tar.gz` and the bitstream `bound_f2_7c_90m.bit`.
+- `release/fpga-f1/upgrade_altcoin_F1Plus_bound_90_fee3.tar.gz`, `upgrade_altcoin_F1_bound_90_fee3.tar.gz` and the
+  bitstream `bound_f1p_3c_90m.bit` (F1 and F1 Plus have the same FPGA).
+- Miner and loader are the same ARM binaries as the F1 Ultra.
+
 Shares only measure the hashrate: this is solo mining, only a whole block pays (the bridge prints it).
 
 ## Dev fee
@@ -60,6 +66,8 @@ The benchmarks have no fee. The source is here: build with `-DDEVFEE_PERCENT=0` 
 |---|---|---|
 | RTX 4090 | 348 kH/s | measured, 8192 hashes in flight (4 GiB of VRAM), default settings |
 | BlackMiner F1 Ultra, one hash board (6 x XC7K420T) | 42-50 kH/s, ~50 W | timing closed at 90 MHz (41.7 kH/s nominal); runs up to 100 MHz in overclock (46.3 kH/s nominal); about 50 kH/s and 50 W reported on a real board |
+| BlackMiner F2, one hash board (6 x XC7VX415T) | 41.7 kH/s nominal | 7 cores per FPGA, timing closed at 90 MHz (WNS +0.043 ns); not tested on a machine |
+| BlackMiner F1 / F1 Plus (XC7K325T) | 2.98 kH/s per FPGA nominal | 3 cores per FPGA (block RAM limit), timing closed at 90 MHz (WNS +0.363 ns); not tested on a machine |
 
 BoundHash moves about 2.1 MB of memory per hash (a 512 KiB scratchpad, 16,384 random 128-byte accesses), so the
 hashrate follows memory bandwidth: GPUs win by a wide margin. On the FPGA every core needs its own scratchpad in
@@ -73,8 +81,8 @@ block RAM (114 RAMB36): 7 cores fit in an XC7K420T.
 - Miners + bridge + patched node end to end on **regtest** (blocks accepted by the node, fee windows paying the fee
   address, reconnection). Done with the real FPGA miner against an emulated chain, and with the GPU miner running
   its kernel on the CPU.
-- **Not tested yet:** the web-interface upgrade package on a machine, the F2 and F1 Plus builds (same scripts,
-  never compiled), networking of the GPU miner on Windows, long runs on mainnet. Use at your own risk.
+- **Not tested yet:** the web-interface upgrade packages on a machine, the F2 and F1 / F1 Plus bitstreams
+  (compiled with timing met, never run on hardware), networking of the GPU miner on Windows, long runs on mainnet. Use at your own risk.
 
 ## Building
 
