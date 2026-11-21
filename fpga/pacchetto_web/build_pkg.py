@@ -9,6 +9,7 @@ Tutto il resto (bm_hooks, bm_freqprof, status.sed, hook di cgminer.sh, runme.sh)
           upgrade_altcoin_F1Ultra_bound_90_fee3.tar.gz
       ... upgrade_altcoin_F2_rigor_175_fee4.tar.gz ../vivado/out_7c_90m/bound_f2.bit 7 90 100 upgrade_altcoin_F2_bound_90_fee3.tar.gz
       ... upgrade_altcoin_F1Plus_rigor_175_fee4.tar.gz ../vivado/out_f1p_3c_90m/bound_f1p.bit 3 90 100 upgrade_altcoin_F1Plus_bound_90_fee3.tar.gz
+  env BOUND_TESTED="data" se il pacchetto e' stato provato in macchina, BOUND_POWER = testo sul consumo (non Ultra)
   env BOUND_FEE (default 3; 0 = pacchetto senza fee), BOUND_MINER (default ../host_c/bound-miner-armv7-1.1-fee<BOUND_FEE>)
 """
 import hashlib, io, os, re, sys, tarfile
@@ -101,6 +102,10 @@ PROVA = ("Il bitstream e il miner sono provati su una F1 Ultra con la BeagleBone
          "l'interfaccia web NON E' ANCORA PROVATO IN MACCHINA" if ULTRA else
          f"Stesso RTL e stesso miner della F1 Ultra (provata in macchina con la BeagleBone); il bitstream per la {MACH}\n"
          "e QUESTO pacchetto NON SONO ANCORA PROVATI IN MACCHINA")
+if os.environ.get("BOUND_TESTED"):   # es. BOUND_TESTED="21/11/2026"
+    PROVA = f"Bitstream, miner e questo pacchetto provati in macchina su una {MACH} ({os.environ['BOUND_TESTED']}). Per controllare"
+else:
+    PROVA += ": dopo"
 f["LEGGIMI.txt"] = f"""BOUND (BoundHash) per BlackMiner {MACH} - pacchetto per l'interfaccia web
 =====================================================================
 
@@ -154,7 +159,7 @@ Avvio, bm_hooks, pagina Frequency con profili giorno / notte, ventole e caricato
 altre monete (CSD, NOID, MDS, QTC, TING, RIGOR). Un extra.conf o fan.conf gia' presente non viene sostituito.
 
 md5: bitstream {md5(bitb)}, bound-miner {md5(miner)}.
-{PROVA}: dopo il primo avvio controlla /tmp/bound.log e
+{PROVA} il primo avvio guarda /tmp/bound.log e
 /tmp/bound_hook.log.
 """.encode()
 order = ["bound-miner", "bound-loadfpga", "fpgaminer_top_bound.bit", "cgminer_bound.conf", "bound_hook.sh", "cgminer_hook.inc",

@@ -9,7 +9,8 @@ moltiplicazione 64x64, SHA-256 all'inizio e alla fine. Blocchi da 10 minuti, 50 
 macchina con la BeagleBone: circa 50 kH/s e 50 W per hash board; in overclock regge fino a 100 MHz. Miner
 `bound-miner` 1.1 con dev fee 3 %, ponte e patch del nodo provati insieme su regtest. Pacchetti nella cartella
 `release/fpga-f1-ultra/`. F2 e F1 / F1 Plus compilati il 21/11 (pacchetti web in `release/fpga-f2/` e `release/fpga-f1/`).
-Non ancora provati in macchina: pacchetti per l'interfaccia web, bitstream F2 e F1 / F1 Plus, mainnet a lungo.
+F2 e F1 / F1 Plus provati in macchina il 21/11 con i pacchetti per l'interfaccia web: funzionano.
+Non ancora provati: pacchetto web della F1 Ultra, mainnet a lungo.
 
 ## Build fuori contesto F1 Ultra (Vivado 2026.1, 16/11, `out_f1u_7c_100m_b0r1m2`)
 7 core, XC7K420T-2: **798 RAMB36 su 835** (114 per core, come previsto), 91.182 LUT (35 %), 41.346 FF (8 %),
@@ -100,11 +101,11 @@ Uscita in `out_<board>_.../RESULT.txt`: WNS, MHz a cui chiude, hash al secondo s
   `BENCH=1 ...` -> PASS (hashrate dai risultati = hashrate dai contatori).
 
 ## Cosa manca
-1. Prova in macchina del pacchetto per l'interfaccia web (quello BBB e' provato).
+1. Prova in macchina del pacchetto web della F1 Ultra (quello BBB e quelli web di F2 / F1 sono provati).
 2. F2 e F1 / F1 Plus: compilati il 21/11 con `set argv {7 90}; set argc 2` e `set argv {f1p 3 90}; set argc 3`.
    F2: WNS +0,043 ns, 88.382 LUT (34,3 %), 798/880 RAMB36, 238 DSP, 4,6 W per FPGA stimati.
    F1 / F1 Plus: WNS +0,363 ns, 38.581 LUT (18,9 %), 342/445 RAMB36, 102 DSP, 2,1 W per FPGA stimati.
-   Mai provati in macchina.
+   Provati in macchina il 21/11 (pacchetti web): funzionano.
 3. Top BCU1525 e FK33: non fatti (solo `build_ooc.tcl` per le misure).
 4. Una GPU rende molto di piu' su questo algoritmo (RTX 4090: ~350 kH/s): vedi la cartella `gpu/`.
 
