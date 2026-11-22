@@ -11,7 +11,11 @@ solo on your own node:
 | `node/` | Patch for the BOUND node (`boundd`) that adds two RPC commands for external miners. |
 | `release/` | Ready-to-use binaries and packages built from this source. |
 
-BOUND has no pool: you run a node, the bridge next to it, and point the miners at the bridge.
+Two ways to mine:
+
+- **Pool (GPU miner, from 0.4):** AriaPool, `bound.ariabrain.com:3373`. Nothing else to run:
+  `bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool bound.ariabrain.com:3373`
+- **Solo:** you run a node, the bridge next to it, and point the miners (GPU or BlackMiner) at the bridge.
 
 ```
 GPU miner / BlackMiner  --Stratum, port 7340-->  bound_bridge.py  --RPC, 127.0.0.1-->  boundd (patched)
@@ -37,8 +41,13 @@ Every miner mines for the address in its own `--user ADDRESS.worker`.
 **3a. GPU** (`release/gpu/`, NVIDIA driver 550 or newer, no CUDA Toolkit needed):
 ```
 bound-gpuminer.exe --bench 20
-bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool IP_OF_THE_BRIDGE:7340
+bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool IP_OF_THE_BRIDGE:7340        (solo, your bridge)
+bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool bound.ariabrain.com:3373     (AriaPool)
 ```
+The pool does not speak Stratum v1 but its own JSON protocol (`login` / `job` / `submit` with the claimed hash); the miner
+detects it by itself. The protocol as observed is written down in `gpu/tools/mock_ariapool.py`, a mock pool used by the
+tests. `--tune` measures at start-up how many hashes in flight give the best rate on your card (the default, 8192, is
+the best value measured on an RTX 4090).
 **3b. BlackMiner F1 Ultra** (`release/fpga-f1-ultra/`):
 - `upgrade_altcoin_F1Ultra_bound_90_fee3.tar.gz`: package for the vendor web interface (Configuration > Upgrade),
   then choose the coin `bound`, pool `stratum+tcp://IP_OF_THE_BRIDGE:7340`, user `YOUR_BOUND_ADDRESS.worker`.
@@ -56,8 +65,8 @@ Shares only measure the hashrate: this is solo mining, only a whole block pays (
 ## Dev fee
 
 Both miners have a **3 % dev fee**, declared at start-up and in `--help`: for 180 seconds every 100 minutes (the
-first time after 20 minutes) the miner logs in to *your* bridge with the developer's address
-`BW1chX39ABzxeVgHqqmTDGL5woHd6GAgj2rqVm4iw4Ty5fG7K1Y7`, so a block found in that window pays the developer.
+first time after 20 minutes) the miner logs in to *your* bridge, or to the pool, with the developer's address
+`BW1chX39ABzxeVgHqqmTDGL5woHd6GAgj2rqVm4iw4Ty5fG7K1Y7`, so what it finds in that window pays the developer.
 The benchmarks have no fee. The source is here: build with `-DDEVFEE_PERCENT=0` (GPU) or `FEE=0` (FPGA) to remove it.
 
 ## Performance
@@ -79,11 +88,14 @@ block RAM (114 RAMB36): 7 cores fit in an XC7K420T.
 - FPGA: core, engine and a chain of FPGAs in simulation; the F1 Ultra bitstream on real hardware with the BeagleBone package;
   the F2 and F1 / F1 Plus bitstreams, miner 1.1 and their web-interface packages on real machines (21 Nov 2026).
 - GPU: the kernel on a real RTX 4090 (hashes identical to the CPU).
+- AriaPool protocol: the miner against the real pool with its kernel on the CPU (login, jobs, accepted shares,
+  22 Nov 2026), and against a mock pool that recomputes every hash (shares, fee windows, reconnection).
 - Miners + bridge + patched node end to end on **regtest** (blocks accepted by the node, fee windows paying the fee
   address, reconnection). Done with the real FPGA miner against an emulated chain, and with the GPU miner running
   its kernel on the CPU.
 - **Not tested yet:** the F1 Ultra web-interface upgrade package on a machine (the F2 and F1 ones are tested),
-  networking of the GPU miner on Windows, long runs on mainnet. Use at your own risk.
+  networking of the GPU miner on Windows, the full GPU miner on a real card against the pool (and the pool's deferred
+  verification of its shares), long runs on mainnet. Use at your own risk.
 
 ## Building
 

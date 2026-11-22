@@ -1,21 +1,33 @@
-bound-gpuminer 0.3 - miner CUDA per BOUND (BoundHash) - 18/11/2026
+bound-gpuminer 0.4 - miner CUDA per BOUND (BoundHash) - 22/11/2026
 ==================================================================
+NOVITA' 0.4: mining in POOL su AriaPool (bound.ariabrain.com:3373) oltre che in solitaria col ponte;
+taratura automatica degli hash in volo (--tune); senza --batch il miner usa 8192 hash in volo o, se la
+VRAM libera non basta, quanti ce ne stanno (prima si fermava).
 Miner GPU per Windows e Linux. Su una RTX 4090 il kernel fa 348,5 kH/s (misurati il 18/11 con bound-gpubench,
 8192 hash in volo e 128 thread per blocco: sono i default del miner).
 
 DEV FEE 3 % (dichiarata): 180 secondi ogni 100 minuti (la prima volta dopo 20 minuti) il miner lavora per
 l'indirizzo dello sviluppatore BW1chX39ABzxeVgHqqmTDGL5woHd6GAgj2rqVm4iw4Ty5fG7K1Y7: in quella finestra
-si presenta al tuo ponte con quell'indirizzo, quindi un blocco trovato in quei 180 s paga lui. Lo scrive
-all'avvio e a ogni finestra. Il bench non ha fee. Serve il ponte di questo repository (un indirizzo per miner).
+si presenta al tuo ponte, o al pool, con quell'indirizzo: quello che trova in quei 180 s va a lui. Lo scrive
+all'avvio e a ogni finestra. Il bench non ha fee. In solitaria serve il ponte di questo repository (un indirizzo per miner).
 
 Cosa serve
   - driver NVIDIA 550 o piu' recente (nessun CUDA Toolkit); scheda RTX 20 o piu' nuova, almeno 6 GB liberi;
-  - il nodo BOUND con la patch e il ponte accesi (cartelle node/ e bridge/ del repository, gli stessi del miner
-    FPGA). BOUND non ha pool: si mina in solitaria sul proprio nodo.
+  - in pool: niente altro (vedi sotto);
+  - in solitaria: il nodo BOUND con la patch e il ponte accesi (cartelle node/ e bridge/ del repository, gli
+    stessi del miner FPGA).
+
+In pool (AriaPool, https://pool.ariabrain.com)
+  avvia_pool.bat: metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO e fai doppio clic. A mano:
+     bound-gpuminer.exe --user B....pc1 --pool bound.ariabrain.com:3373
+  Il pool non parla Stratum v1 ma un suo protocollo (login / job / submit): il miner lo riconosce da solo
+  (--proto aria per forzarlo). Il pool decide la difficolta' delle share (200000 all'inizio); --diff N ne chiede un'altra.
+  Le share accettate risultano "in attesa di verifica": il pool le ricontrolla dopo e i conti si vedono sulla sua pagina.
+  Il pool finto dei test e la descrizione del protocollo sono in tools/mock_ariapool.py.
 
 Uso
   1. prova a vuoto, senza ponte:      bench.bat            (20 secondi, stampa i kH/s)
-  2. mining: apri avvia.bat con il Blocco note, metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO
+  2. in solitaria: apri avvia.bat con il Blocco note, metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO
      (e l'IP del ponte se non e' su questo PC), salva e fai doppio clic.
      bound-gpuminer.exe --user B....pc1 --pool 127.0.0.1:7340
   Se il ponte gira in WSL su questo stesso PC, 127.0.0.1:7340 di solito funziona; altrimenti usa l'IP del PC.
@@ -29,7 +41,11 @@ Cosa si vede
 
 Opzioni
   --gpu N          scheda (default 0; per piu' schede, per ora, un miner per scheda con --gpu diversi)
-  --batch N        hash in volo (default 8192 = 4 GiB di VRAM; sulla 4090 e' il valore migliore misurato)
+  --batch N        hash in volo (default 8192 = 4 GiB di VRAM, il valore migliore misurato sulla 4090; se la VRAM
+                   libera non basta, quanti ce ne stanno)
+  --tune           all'avvio prova da 2048 a 16384 hash in volo (10 s), stampa i kH/s di ognuno e usa il migliore:
+                   da usare una volta su ogni scheda diversa dalla 4090, poi si mette il valore in --batch
+  --proto X        auto (default) | aria (AriaPool) | stratum (ponte)        --diff N   difficolta' chiesta al pool
   --block N        thread per blocco (default 128)
   --share-s S      secondi tra le share (default 10)
   --bench S        solo la velocita'
@@ -39,7 +55,9 @@ un'altra scheda; mandami bound-gpubench.log.
 Stato: kernel verificato bit a bit sulla CPU e provato su una RTX 4090 (hash uguali alla CPU, 348,5 kH/s).
 Il miner (rete, dev fee) e' provato da capo a fondo SENZA GPU: kernel sulla CPU, ponte vero, nodo regtest vero:
 blocchi accettati, blocchi della finestra di fee pagati all'indirizzo della fee, ricollegamento dopo la caduta
-del ponte. La parte di rete su Windows e la mainnet non sono ancora state provate.
+del ponte. Il protocollo di AriaPool e' provato contro il pool vero (accesso, job, share accettate, 22/11) con il
+kernel sulla CPU, e contro un pool finto che ricalcola ogni hash (share, dev fee, ricollegamento). Non ancora provati:
+il miner completo su una GPU vera contro il pool, e la verifica differita delle share da parte del pool.
 Linux: dist/bound-gpuminer (glibc 2.17 o piu' recente), stesse opzioni.
 
 Sorgenti: src/ (bound_kernel.cu, gpuminer.c, gpubench.c, gpu_common.h, bound_pow.c), tools/, build.sh.

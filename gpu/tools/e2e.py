@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Prova da capo a fondo di bound-gpuminer senza GPU: il kernel gira sulla CPU (--cpu-backend, 64 righe = regtest),
-il resto e' tutto vero: Stratum verso pc_bridge/bound_bridge.py, che parla con `boundd --regtest` con la patch.
+il resto e' tutto vero: Stratum verso ../bridge/bound_bridge.py, che parla con `boundd --regtest` con la patch.
    BOUNDD=.../boundd BOUNDCLI=.../bound-cli MINER=/tmp/bound-gpuminer python3 tools/e2e.py [secondi]"""
 import json, os, random, shutil, subprocess, sys, tempfile, threading, time
 here = os.path.dirname(os.path.abspath(__file__)); root = os.path.dirname(here)
 DUR = float(sys.argv[1]) if len(sys.argv) > 1 else 25
 BOUNDD, CLI, MINER = os.environ.get("BOUNDD", "boundd"), os.environ.get("BOUNDCLI", "bound-cli"), os.environ.get("MINER", os.path.join(root, "dist", "bound-gpuminer"))
+BRIDGE = os.path.join(root, "..", "bridge", "bound_bridge.py")
 dd = tempfile.mkdtemp(prefix="bound_gpu_e2e_"); wd = tempfile.mkdtemp(prefix="bound_gpu_wd_")
 RPC, STR = 18700 + random.randint(0, 80), 17440 + random.randint(0, 80)
 node = subprocess.Popen([BOUNDD, "--regtest", "--datadir", dd, "node", "--noseeds", "--nolisten", "--rpcport", str(RPC)], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -24,14 +25,14 @@ def run(cmd, sink, cwd=None):
     threading.Thread(target=lambda: [sink.append(l.rstrip()) for l in p.stdout], daemon=True).start()
     return p
 blog, mlog = [], []
-bridge = run([sys.executable, os.path.join(root, "pc_bridge", "bound_bridge.py"), "--address", ADDR, "--datadir", dd, "--rpc", "127.0.0.1:%d" % RPC,
+bridge = run([sys.executable, BRIDGE, "--address", ADDR, "--datadir", dd, "--rpc", "127.0.0.1:%d" % RPC,
               "--listen", "127.0.0.1:%d" % STR, "--refresh", "5"], blog)
 time.sleep(1)
 miner = run([MINER, "--cpu-backend", "--lines", "64", "--batch", "512", "--pool", "127.0.0.1:%d" % STR, "--user", ADDR + ".gpu", "--share-s", "2"], mlog, cwd=wd)
 time.sleep(DUR)
 # il ponte cade e torna: il miner deve ricollegarsi da solo
 bridge.terminate(); time.sleep(4)
-bridge = run([sys.executable, os.path.join(root, "pc_bridge", "bound_bridge.py"), "--address", ADDR, "--datadir", dd, "--rpc", "127.0.0.1:%d" % RPC,
+bridge = run([sys.executable, BRIDGE, "--address", ADDR, "--datadir", dd, "--rpc", "127.0.0.1:%d" % RPC,
               "--listen", "127.0.0.1:%d" % STR, "--refresh", "5"], blog)
 time.sleep(12)
 miner.terminate(); time.sleep(0.3)

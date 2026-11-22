@@ -25,7 +25,7 @@
 #include "bound_pow.h"
 #include "kernel_ptx.h"
 #include "third_party/cJSON.h"
-#define VERSION "0.3"
+#define VERSION "0.4"
 #ifndef DEVFEE_PERCENT
 #define DEVFEE_PERCENT 3
 #endif
@@ -101,7 +101,26 @@ static struct {
     int fee, fee_refused, submit_fee[64];   /* finestra della dev fee in corso; share mandate durante la fee */
     int msgid; int sub_id, auth_id; int submit_ids[64]; int nsub;
     double suggest;
+    /* protocollo AriaPool (login / job / submit con claimed_hash): vedi LEGGIMI */
+    int proto;                   /* 0 auto, 1 stratum (ponte), 2 aria */
+    int aria, login_id; double t_keep, diff_hint;
+    struct { char id[64]; uint8_t base[76]; uint64_t start, count; int height, valid; } ajob, awork;
+    int last_height;
 } M;
+#define LBL (M.aria ? "pool" : "ponte")
+static int pool_send(const char *line);
+
+static void aria_login(void)
+{
+    char b[640], addr[128], hint[64] = ""; const char *user = M.fee ? DEVFEE_ADDRESS ".devfee" : M.user, *dot = strchr(user, '.');
+    snprintf(addr, sizeof addr, "%.*s", dot ? (int)(dot - user) : (int)strlen(user), user);
+    if (M.diff_hint > 0) snprintf(hint, sizeof hint, ",\"difficulty_hint\":%.0f", M.diff_hint);
+    M.login_id = ++M.msgid;
+    snprintf(b, sizeof b, "{\"id\":%d,\"method\":\"login\",\"params\":{\"address\":\"%s\",\"worker\":\"%s\","
+             "\"capabilities\":[\"submit_claimed_hash\",\"difficulty_hint\"]%s,\"agent\":\"bound-gpuminer/" VERSION "\"}}\n",
+             M.login_id, addr, dot && dot[1] ? dot + 1 : "gpu", hint);
+    pool_send(b);
+}
 
 static int pool_send(const char *line)
 {
@@ -120,17 +139,19 @@ static int pool_connect(void)
     struct addrinfo hints, *res = NULL; char port[16];
     memset(&hints, 0, sizeof hints); hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     snprintf(port, sizeof port, "%d", M.port);
-    if (getaddrinfo(M.host, port, &hints, &res) || !res) { tsay("ponte: non trovo %s", M.host); return -1; }
+    if (getaddrinfo(M.host, port, &hints, &res) || !res) { tsay("%s: non trovo %s", LBL, M.host); return -1; }
     M.s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (M.s == SOCK_BAD || connect(M.s, res->ai_addr, (int)res->ai_addrlen)) {
         if (M.s != SOCK_BAD) sock_close(M.s);
         M.s = SOCK_BAD; freeaddrinfo(res);
-        tsay("ponte: nessuna connessione a %s:%d (il ponte e' acceso? vedi LEGGIMI)", M.host, M.port); return -1;
+        tsay(M.proto == 2 ? "pool: nessuna connessione a %s:%d" : "ponte: nessuna connessione a %s:%d (il ponte e' acceso? vedi LEGGIMI)", M.host, M.port); return -1;
     }
     freeaddrinfo(res);
     int one = 1; setsockopt(M.s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
     sock_nonblock(M.s);
     M.rlen = 0; M.subscribed = M.authorized = 0; M.job.valid = M.work.valid = 0; M.nsub = 0; M.diff = 0;
+    M.ajob.valid = M.awork.valid = 0; M.aria = M.proto == 2; M.t_keep = now_s();
+    if (M.aria) { aria_login(); tsay("pool: collegato a %s:%d%s", M.host, M.port, M.fee ? " (dev fee)" : ""); return 0; }
     const char *user = M.fee ? DEVFEE_ADDRESS ".devfee" : M.user;
     char b[512];
     M.sub_id = ++M.msgid;
@@ -150,6 +171,52 @@ static void on_line(char *line)
     if (!j) return;
     cJSON *method = cJSON_GetObjectItem(j, "method"), *params = cJSON_GetObjectItem(j, "params"), *id = cJSON_GetObjectItem(j, "id"),
           *result = cJSON_GetObjectItem(j, "result"), *error = cJSON_GetObjectItem(j, "error");
+    if (cJSON_IsString(error) && strstr(error->valuestring, "unknown method") && !M.aria && M.proto != 1) {
+        /* non e' Stratum v1: e' il protocollo di AriaPool (bound.ariabrain.com) */
+        if (cJSON_IsNumber(id) && id->valueint == M.sub_id) { M.proto = 2; M.aria = 1; tsay("pool: protocollo AriaPool"); aria_login(); }
+        cJSON_Delete(j); return;
+    }
+    if (M.aria) {
+        if (cJSON_IsString(method) && !strcmp(method->valuestring, "job") && cJSON_IsObject(params)) {
+            cJSON *hb = cJSON_GetObjectItem(params, "header_base"), *tg = cJSON_GetObjectItem(params, "target"), *ji = cJSON_GetObjectItem(params, "job_id"),
+                  *df = cJSON_GetObjectItem(params, "difficulty"), *hg = cJSON_GetObjectItem(params, "height");
+            const char *ps = strstr(line, "\"nonce_start\":"), *pe = strstr(line, "\"nonce_end\":");   /* 64 bit: non passano da un double */
+            uint8_t tb[32]; int ok = cJSON_IsString(hb) && cJSON_IsString(tg) && cJSON_IsString(ji) && ps && pe;
+            memset(&M.ajob, 0, sizeof M.ajob);
+            ok = ok && hex2bin(hb->valuestring, M.ajob.base, 76) == 76 && strlen(hb->valuestring) == 152 && hex2bin(tg->valuestring, tb, 32) == 32;
+            if (ok) {
+                uint64_t a = strtoull(ps + 14, NULL, 10), e = strtoull(pe + 12, NULL, 10);
+                for (int i = 0; i < 32; i++) M.share_target[i] = tb[31 - i];     /* il pool scrive il numero, noi teniamo i byte little-endian */
+                snprintf(M.ajob.id, sizeof M.ajob.id, "%s", ji->valuestring);
+                M.ajob.start = a; M.ajob.count = e >= a ? e - a + 1 : 0; M.ajob.height = cJSON_IsNumber(hg) ? hg->valueint : 0;
+                M.ajob.valid = M.ajob.count > 0; M.newjob = 1;
+                double d = cJSON_IsNumber(df) ? df->valuedouble : 0;
+                if (d != M.diff) { M.diff = d > 0 ? d : 1; tsay("pool: difficolta' %.6g", M.diff); }
+                if (M.ajob.height != M.last_height) { M.last_height = M.ajob.height; tsay("pool: blocco nuovo (altezza %d)", M.ajob.height); }
+            } else tsay("pool: job non valido");
+        } else if (cJSON_IsNumber(id)) {
+            int i = id->valueint; const char *why = cJSON_IsString(error) ? error->valuestring : NULL;
+            if (i == M.login_id) {
+                M.authorized = !why;
+                if (M.fee) { if (why) M.fee_refused = 1; }
+                else if (why) tsay("pool: accesso rifiutato: %s (--user deve essere INDIRIZZO_BOUND.nome)", why);
+                else tsay("pool: accesso fatto come %s", M.user);
+            } else for (int k = 0; k < M.nsub; k++) if (M.submit_ids[k] == i) {
+                int fee = M.submit_fee[k];
+                M.submit_ids[k] = M.submit_ids[--M.nsub]; M.submit_fee[k] = M.submit_fee[M.nsub];
+                if (!why && cJSON_IsTrue(cJSON_GetObjectItem(result, "accepted"))) {
+                    if (fee) { M.fee_accepted++; tsay("share accettata (dev fee)"); }
+                    else { M.accepted++; tsay("share accettata (%llu)", M.accepted); }
+                } else {
+                    if (!why) why = "non accettata";
+                    if (strstr(why, "stale") || strstr(why, "job")) M.stale++; else M.rejected++;
+                    tsay("share rifiutata: %s", why);
+                }
+                break;
+            }
+        }
+        cJSON_Delete(j); return;
+    }
     if (cJSON_IsString(method)) {
         if (!strcmp(method->valuestring, "mining.set_difficulty") && cJSON_GetArraySize(params) >= 1) {
             M.diff = cJSON_GetArrayItem(params, 0)->valuedouble;
@@ -224,6 +291,13 @@ static int pool_poll(void)
 static void new_work(void)
 {
     uint8_t cb[1024]; int n = 0;
+    if (M.aria) {                                 /* header = header_base + nonce; il nonce a 64 bit ha i 32 bassi nell'header */
+        M.awork = M.ajob; M.newjob = 0;
+        memcpy(M.header, M.awork.base, 76); memset(M.header + 76, 0, 4);
+        M.next_nonce = (uint32_t)M.awork.start;
+        M.nonces_left = M.awork.count; if (M.nonces_left > (1ull << 32) - M.next_nonce) M.nonces_left = (1ull << 32) - M.next_nonce;
+        return;
+    }
     M.work = M.job; M.newjob = 0;
     M.xn2++;
     memcpy(cb, M.work.coinb1, (size_t)M.work.n1); n = M.work.n1;
@@ -236,9 +310,17 @@ static void new_work(void)
     M.next_nonce = 0; M.nonces_left = 1ull << 32;
 }
 
-static void submit(uint32_t nonce)
+static void submit(uint32_t nonce, const uint8_t hash[32])
 {
     char b[512], x2[16], nt[16], nh[16]; uint8_t t[4];
+    if (M.aria) {
+        char hx[65]; int id = ++M.msgid;
+        bin2hex(hash, 32, hx);
+        if (M.nsub < 64) { M.submit_fee[M.nsub] = M.fee; M.submit_ids[M.nsub++] = id; }
+        snprintf(b, sizeof b, "{\"id\":%d,\"method\":\"submit\",\"params\":{\"job_id\":\"%s\",\"nonce\":%llu,\"claimed_hash\":\"%s\"}}\n", id, M.awork.id,
+                 (unsigned long long)((M.awork.start & 0xFFFFFFFF00000000ull) | nonce), hx);
+        pool_send(b); return;
+    }
     for (int i = 0; i < M.xn2n; i++) t[i] = (uint8_t)(M.xn2 >> (8 * i));
     bin2hex(t, M.xn2n, x2); bin2hex(M.work.ntime, 4, nt);
     t[0] = (uint8_t)nonce; t[1] = (uint8_t)(nonce >> 8); t[2] = (uint8_t)(nonce >> 16); t[3] = (uint8_t)(nonce >> 24);
@@ -253,7 +335,8 @@ static void submit(uint32_t nonce)
 int main(int argc, char **argv)
 {
     int dev_i = 0, cpu = 0;
-    unsigned lines = 4096, batch = 8192, block = 128;
+    unsigned lines = 4096, batch = 0, block = 128;
+    int tune = 0;
     double bench = 0, share_s = 10;
     M.host = "127.0.0.1"; M.port = 7340; M.user = NULL; M.s = SOCK_BAD;
     static char hostbuf[256];
@@ -273,23 +356,50 @@ int main(int argc, char **argv)
             M.host = hostbuf; i++;
         }
         else if (!strcmp(a, "--cpu-backend")) cpu = 1;
+        else if (!strcmp(a, "--tune")) tune = 1;
+        else if (!strcmp(a, "--diff")) { M.diff_hint = atof(v); i++; }
+        else if (!strcmp(a, "--proto")) { M.proto = !strcmp(v, "aria") ? 2 : !strcmp(v, "stratum") ? 1 : 0; i++; }
         else {
-            printf("bound-gpuminer " VERSION "\n  --user INDIRIZZO.nome  [--pool HOST:7340] [--gpu N] [--batch 8192] [--block 128] [--share-s 10]\n  --bench SECONDI        solo la velocita', senza ponte\n");
-            if (DEVFEE_PERCENT > 0) printf("\nDev fee: %d %% del tempo (%.0f s ogni %.0f minuti) il miner lavora per l'indirizzo dello sviluppatore\n" DEVFEE_ADDRESS "\n(si presenta al tuo ponte con quell'indirizzo). Il bench non ha fee.\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
+            printf("bound-gpuminer " VERSION "\n  --user INDIRIZZO.nome  [--pool HOST:PORTA] [--gpu N] [--batch N] [--block 128] [--tune] [--share-s 10]\n"
+                   "  --pool bound.ariabrain.com:3373   pool AriaPool (riconosciuto da solo; --proto aria|stratum per forzare, --diff N difficolta' chiesta)\n"
+                   "  --pool IP_DEL_PC:7340             in solitaria sul proprio nodo, col ponte bound_bridge.py\n"
+                   "  --tune                 all'avvio misura quanti hash in volo rendono di piu' su questa scheda (10 s) e usa quel valore\n"
+                   "  --bench SECONDI        solo la velocita', senza rete\n");
+            if (DEVFEE_PERCENT > 0) printf("\nDev fee: %d %% del tempo (%.0f s ogni %.0f minuti) il miner lavora per l'indirizzo dello sviluppatore\n" DEVFEE_ADDRESS "\n(si presenta al tuo ponte o al pool con quell'indirizzo). Il bench non ha fee.\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
             return 2;
         }
     }
     logf = fopen("bound-gpuminer.log", "a");
     say("bound-gpuminer " VERSION " - BOUND (BoundHash) su GPU NVIDIA\n");
-    if (DEVFEE_PERCENT > 0) say("dev fee %d %%: %.0f s ogni %.0f minuti il miner lavora per " DEVFEE_ADDRESS " (sul tuo ponte)\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
+    if (DEVFEE_PERCENT > 0) say("dev fee %d %%: %.0f s ogni %.0f minuti il miner lavora per " DEVFEE_ADDRESS " (sul tuo ponte o pool)\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
     else say("nessuna dev fee (build senza fee)\n");
     if (bp_selftest()) { say("selftest BoundHash sulla CPU FALLITO\n"); return 1; }
     if (bp_set_lines(lines)) return 1;
     if (!bench && !M.user) { say("manca --user INDIRIZZO_BOUND.nome (oppure --bench 20)\n"); return 2; }
     batch = (batch / block) * block;
     gpu_t g;
-    if (gpu_open(&g, dev_i, cpu, lines, batch, kernel_ptx)) return 1;
+    /* senza --batch: 8192 hash in volo (il meglio misurato sulla RTX 4090) o quanti ne stanno in memoria; con --tune fino a 16384 */
+    gpu_cap = tune ? 16384 : 8192;
+    if (gpu_open(&g, dev_i, cpu, lines, tune ? 0 : batch, kernel_ptx)) return 1;
     g.block = block; batch = (unsigned)(g.batch_alloc / block) * block;
+    if (tune) {
+        unsigned cand[] = { 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384 }, best = 0; double rbest = 0;
+        uint8_t h[80] = {0}; uint32_t base = 0;
+        say("taratura: hash in volo -> kH/s\n");
+        for (unsigned k = 0; k < sizeof cand / sizeof cand[0]; k++) {
+            unsigned n = cand[k] / block * block; if (n > batch || n == 0) continue;
+            make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n;         /* riscaldamento */
+            double t0 = now_s(), dt; unsigned long long done = 0;
+            do { make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n; done += n; dt = now_s() - t0; } while (dt < (cpu ? 0.2 : 0.8));
+            say("  %6u  %7.1f\n", n, done / dt / 1e3);
+            if (done / dt > rbest * 1.005) { rbest = done / dt; best = n; }             /* a parita' vince il piu' piccolo: meno VRAM */
+        }
+        if (best && best < batch && !cpu) {                                              /* tengo solo la memoria che serve */
+            cuMemFree(g.d_pad); CK(cuMemAlloc(&g.d_pad, (size_t)best * lines * 128));
+        }
+        if (best) batch = best;
+        say("taratura: scelgo %u hash in volo (%.1f kH/s). Per saltarla la prossima volta: --batch %u\n", batch, rbest / 1e3, batch);
+    }
     say("%u hash in volo (%.1f GiB), %u thread per blocco\n", batch, batch * (double)lines * 128 / 1073741824.0, block);
 
     /* controllo iniziale: un lancio piccolo confrontato con la CPU */
@@ -326,18 +436,25 @@ int main(int argc, char **argv)
             tsay("dev fee: %.0f s per %s", fee_end - tf, DEVFEE_ADDRESS);
             sock_close(M.s); M.s = SOCK_BAD; t_retry = 0;
         } else if (M.fee && (tf >= fee_end || M.fee_refused)) {
-            tsay(M.fee_refused ? "dev fee: il ponte non accetta l'indirizzo (ponte vecchio?), finestra saltata" : "dev fee: finita, torno al tuo indirizzo");
+            tsay(M.fee_refused ? "dev fee: indirizzo non accettato (ponte vecchio?), finestra saltata" : "dev fee: finita, torno al tuo indirizzo");
             M.fee = 0;
             if (M.s != SOCK_BAD) { sock_close(M.s); M.s = SOCK_BAD; }
             t_retry = 0;
         }
         if (M.s == SOCK_BAD) {
             if (now_s() < t_retry) { sleep_ms(200); continue; }
-            if (pool_connect()) { t_retry = now_s() + 5; if (M.fee) { M.fee = 0; tsay("dev fee: ponte non raggiungibile, finestra saltata"); } continue; }
+            if (pool_connect()) { t_retry = now_s() + 5; if (M.fee) { M.fee = 0; tsay("dev fee: nessuna connessione, finestra saltata"); } continue; }
         }
-        if (pool_poll()) { tsay("ponte: connessione persa, riprovo"); sock_close(M.s); M.s = SOCK_BAD; t_retry = now_s() + 3; continue; }
-        if (!(M.subscribed && M.authorized && M.job.valid && M.diff > 0)) { sleep_ms(20); continue; }
-        if (M.newjob || !M.work.valid || M.nonces_left < batch) new_work();
+        if (pool_poll()) { tsay("%s: connessione persa, riprovo", LBL); sock_close(M.s); M.s = SOCK_BAD; t_retry = now_s() + 3; continue; }
+        if (M.aria) {
+            if (now_s() - M.t_keep > 30) { char kb[96]; snprintf(kb, sizeof kb, "{\"id\":%d,\"method\":\"keepalive\",\"params\":{}}\n", ++M.msgid); pool_send(kb); M.t_keep = now_s(); }
+            if (!(M.authorized && M.ajob.valid)) { sleep_ms(20); continue; }
+            if (M.newjob || !M.awork.valid) new_work();
+            if (M.nonces_left < batch) { sleep_ms(50); continue; }        /* intervallo di nonce finito: aspetto il prossimo job */
+        } else {
+            if (!(M.subscribed && M.authorized && M.job.valid && M.diff > 0)) { sleep_ms(20); continue; }
+            if (M.newjob || !M.work.valid || M.nonces_left < batch) new_work();
+        }
         make_job(&g, M.header, M.next_nonce, bp_top64(M.share_target), 0);
         if (launch(&g, batch)) return 1;
         hashes += batch;
@@ -346,11 +463,11 @@ int main(int argc, char **argv)
             bp_hash_nonce(M.header, nonce, hh);                       /* ogni nonce ricontrollato sulla CPU */
             if (bp_top64(hh) > bp_top64(M.share_target)) { M.hw++; tsay("ERRORE: la GPU ha dato un nonce sbagliato (%08x)", nonce); continue; }
             if (!bp_le256_le(hh, M.share_target)) continue;           /* sotto i 64 bit alti ma sopra il target intero */
-            M.found++; submit(nonce);
+            M.found++; submit(nonce, hh);
         }
         M.next_nonce += batch; M.nonces_left -= batch;
         double t = now_s();
-        if (M.suggest == 0 && t - t_start > 3) {                      /* difficolta' sulla velocita' vera */
+        if (!M.aria && M.suggest == 0 && t - t_start > 3) {                      /* difficolta' sulla velocita' vera */
             char b[128];
             M.suggest = (hashes / (t - t_start)) * share_s / 4294967296.0;
             snprintf(b, sizeof b, "{\"id\":%d,\"method\":\"mining.suggest_difficulty\",\"params\":[%.6g]}\n", ++M.msgid, M.suggest);

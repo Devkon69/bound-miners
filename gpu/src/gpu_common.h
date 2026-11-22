@@ -97,6 +97,7 @@ static int launch(gpu_t *g, unsigned batch)
 /* apre la scheda dev_i (o il backend CPU), carica il kernel e alloca gli scratchpad per `want` hash in volo
  * (0 = quanti ne stanno nella memoria libera meno 1 GiB, al piu' 40960). Ritorna 0 se va bene. */
 static void *gpu_ctx;
+static size_t gpu_cap = 40960;   /* tetto degli hash in volo quando want = 0 */
 __attribute__((unused)) static int gpu_open(gpu_t *g, int dev_i, int cpu, unsigned lines, unsigned want, const void *ptx)
 {
     memset(g, 0, sizeof *g);
@@ -125,6 +126,7 @@ __attribute__((unused)) static int gpu_open(gpu_t *g, int dev_i, int cpu, unsign
     size_t keep = cpu ? 0 : (size_t)1 << 30;
     size_t maxb = freeb > keep ? (freeb - keep) / (per + 32) : 0;
     if (maxb > 40960) maxb = 40960;
+    if (!want && maxb > gpu_cap) maxb = gpu_cap;
     if (want) { if (want > maxb) { say("%u hash in volo non stanno in memoria (al piu' %u)\n", want, (unsigned)maxb); return -1; } maxb = want; }
     maxb &= ~(size_t)255;
     if (maxb < 256) { say("memoria insufficiente (%.0f MiB liberi)\n", freeb / 1048576.0); return -1; }
