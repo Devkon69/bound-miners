@@ -2,7 +2,7 @@
 # Il ponte (pc_bridge/bound_bridge.py) parla stratum+tcp in chiaro: build NO_TLS, come rigor-miner e ting-miner 1.1.
 #
 #   pip install ziglang
-#   make -f bound.mk arm              (-> bound-miner-armv7-1.1-fee3; FEE=0 per la build senza fee)
+#   make -f bound.mk arm              (-> bound-miner-armv7-1.2-fee3; FEE=0 per la build senza fee)
 #   make -f bound.mk native           (PC, per sim/host_e2e.py)
 #   make -f bound.mk loader           (bound-loadfpga-armv7, da csd_loadfpga.c)
 # bound_main.c si rigenera da rigor_main.c con make_bound.py.
@@ -12,7 +12,7 @@ SRC = bound_main.c bound_pow.c csd_pow.c third_party/cJSON.c
 CFLAGS += -O2 -Wall -Wno-unused-result -Wno-date-time -std=gnu99 -DNO_TLS
 ARMCC ?= ./zcc
 FEE ?= 3
-VER = 1.1
+VER = 1.2
 
 bound_main.c: rigor_main.c make_bound.py
 	python3 make_bound.py rigor_main.c bound_main.c

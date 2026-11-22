@@ -15,6 +15,10 @@ che sale, coinbase all'indirizzo dato), nessuna share rifiutata per difficolta',
 lavori nuovi a ogni blocco.
 
   BOUNDD=/percorso/boundd BOUNDCLI=/percorso/bound-cli python3 sim/host_e2e.py [SECONDI]
+
+ARIA=1: al posto di ponte e nodo, il pool finto col protocollo di AriaPool (gpu/tools/mock_ariapool.py, ricalcola ogni
+hash e rifiuta i doppioni) e DUE catene da 3 FPGA: tutti lavorano sullo stesso header, su fette diverse dei nonce.
+  ARIA=1 [FEETEST=1] python3 sim/host_e2e.py [SECONDI]
 """
 import ctypes, os, sys, pty, tty, time, threading, subprocess, struct, select, random, json, shutil, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.normpath(os.path.join(HERE, '..'))
@@ -29,6 +33,9 @@ subprocess.check_call(['gcc', '-std=gnu99', '-O2', '-shared', '-fPIC', '-o', os.
                        os.path.join(HC, 'bound_pow.c'), '-lm'])
 lib = ctypes.CDLL(os.path.join(obj, 'libboundpow.so')); lib.bp_set_lines(LINES)
 
+ARIA = os.environ.get('ARIA') == '1'
+if ARIA:
+    exec(open(os.path.join(HERE, 'host_e2e_aria.py')).read()); sys.exit(0)
 # ------------------------------------------------------------------ nodo regtest + ponte
 dd = tempfile.mkdtemp(prefix='bound_e2e_')
 RPCPORT, STRATUM = 18600 + random.randint(0, 80), 17340 + random.randint(0, 80)
@@ -52,7 +59,7 @@ subprocess.check_call(['gcc', '-std=gnu99', '-O2', '-Wall', '-Wno-unused-result'
                       ['-o', os.path.join(obj, 'bound-miner'), os.path.join(HC, 'bound_main.c'), os.path.join(HC, 'bound_pow.c'),
                        os.path.join(HC, 'csd_pow.c'), os.path.join(HC, 'third_party', 'cJSON.c'), '-lm'])
 h0 = cli('getblockcount')
-bridge = subprocess.Popen([sys.executable, os.path.join(ROOT, 'pc_bridge', 'bound_bridge.py'), '--address', ADDR, '--datadir', dd,
+bridge = subprocess.Popen([sys.executable, os.path.join(ROOT, '..', 'bridge', 'bound_bridge.py'), '--address', ADDR, '--datadir', dd,
                            '--rpc', '127.0.0.1:%d' % RPCPORT, '--listen', '127.0.0.1:%d' % STRATUM, '--refresh', '5'],
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 blog = []

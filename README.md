@@ -13,8 +13,9 @@ solo on your own node:
 
 Two ways to mine:
 
-- **Pool (GPU miner, from 0.4):** AriaPool, `bound.ariabrain.com:3373`. Nothing else to run:
-  `bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool bound.ariabrain.com:3373`
+- **Pool (GPU miner from 0.4, BlackMiner miner from 1.2):** AriaPool, `bound.ariabrain.com:3373`. Nothing else to run:
+  `bound-gpuminer.exe --user YOUR_BOUND_ADDRESS.pc1 --pool bound.ariabrain.com:3373`; on a BlackMiner the packages come
+  with that pool already set, you only enter your address.
 - **Solo:** you run a node, the bridge next to it, and point the miners (GPU or BlackMiner) at the bridge.
 
 ```
@@ -52,7 +53,7 @@ the best value measured on an RTX 4090).
 - `upgrade_altcoin_F1Ultra_bound_90_fee3.tar.gz`: package for the vendor web interface (Configuration > Upgrade),
   then choose the coin `bound`, pool `stratum+tcp://IP_OF_THE_BRIDGE:7340`, user `YOUR_BOUND_ADDRESS.worker`.
 - `bound-ultra-bbb-fee3.zip`: package for hash boards driven by a BeagleBone Black rev C.
-- `bound_f1u_7c_90m.bit`, `bound-miner-armv7-1.1-fee3`, `bound-loadfpga-armv7`: the single pieces.
+- `bound_f1u_7c_90m.bit`, `bound-miner-armv7-1.2-fee3`, `bound-loadfpga-armv7`: the single pieces.
 
 **3c. BlackMiner F2, F1 Plus, F1** (web-interface packages, same use as the F1 Ultra one; tested on the machines):
 - `release/fpga-f2/upgrade_altcoin_F2_bound_90_fee3.tar.gz` and the bitstream `bound_f2_7c_90m.bit`.
@@ -88,14 +89,15 @@ block RAM (114 RAMB36): 7 cores fit in an XC7K420T.
 - FPGA: core, engine and a chain of FPGAs in simulation; the F1 Ultra bitstream on real hardware with the BeagleBone package;
   the F2 and F1 / F1 Plus bitstreams, miner 1.1 and their web-interface packages on real machines (21 Nov 2026).
 - GPU: the kernel on a real RTX 4090 (hashes identical to the CPU).
-- AriaPool protocol: the miner against the real pool with its kernel on the CPU (login, jobs, accepted shares,
-  22 Nov 2026), and against a mock pool that recomputes every hash (shares, fee windows, reconnection).
+- AriaPool protocol: the GPU miner (kernel on the CPU) and the BlackMiner miner 1.2 (emulated FPGA chains) against the
+  real pool (login, jobs, accepted shares, 22 Nov 2026), and against a mock pool that recomputes every hash (shares, fee
+  windows, reconnection, no nonce tried twice across boards).
 - Miners + bridge + patched node end to end on **regtest** (blocks accepted by the node, fee windows paying the fee
   address, reconnection). Done with the real FPGA miner against an emulated chain, and with the GPU miner running
   its kernel on the CPU.
 - **Not tested yet:** the F1 Ultra web-interface upgrade package on a machine (the F2 and F1 ones are tested),
-  networking of the GPU miner on Windows, the full GPU miner on a real card against the pool (and the pool's deferred
-  verification of its shares), long runs on mainnet. Use at your own risk.
+  networking of the GPU miner on Windows, the full GPU miner on a real card against the pool, BlackMiner miner 1.2 on a
+  real machine (1.1 is the one tested), the pool's deferred verification of the shares, long runs on mainnet. Use at your own risk.
 
 ## Building
 

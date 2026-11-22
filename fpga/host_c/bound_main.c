@@ -58,7 +58,7 @@
 #include "ca_bundle.h"
 extern const char *mbedtls_platform_dev_random;      /* library/entropy_poll.c */
 #endif
-#define VERSION "1.1"
+#define VERSION "1.2"
 #define MAX_CHAINS 4
 #define MAX_FPGA 16
 
@@ -96,6 +96,7 @@ static struct {
     int freq_max;               /* --freq-max: ceiling for the hash clock (0 = build + 15) */
     int vendor_loader;          /* reload the bitstream with the vendor loadfpga, not bound-loadfpga */
     double job_s;               /* new job for an FPGA after this many seconds (0 = 30 s) */
+    int proto;                  /* 0 auto, 1 stratum, 2 AriaPool */
     int byteorder;              /* stratum fields: 0 auto, 1 btc (standard Bitcoin), 2 raw (bound cpuminer) */
 } opt;
 
@@ -203,6 +204,7 @@ typedef struct {
     uint32_t xn2;
     char job_id[96], ntime_hex[16];
     long seq;
+    int aria; uint64_t nonce_hi;     /* AriaPool: job nonce = nonce_hi << 32 | header nonce */
     int bench;
     uint32_t seen[16]; int nseen;    /* results already handled (a clock change restarts the range) */
 } work_t;
@@ -212,6 +214,7 @@ typedef struct {
     int present, cores, rounds, mhz, vmaj, vmin, built_mhz, prev_job;
     double job_t0;                      /* when the running job was sent */
     int have_status, flags, job_id, drops, addr;
+    long aria_seq; int aria_r;       /* AriaPool: nonce slices taken from the current job */
     double temp, status_t, rate, prev_t;
     uint32_t iter, prev_iter;
     long good, hwerr;
@@ -653,6 +656,11 @@ static uint8_t share_target[32];
 static long accepted, rejected, stale;
 static int next_id = 10;
 typedef struct { int id, fee, pool, order; double diff; } pend_t;
+/* AriaPool (bound.ariabrain.com): its own JSON protocol instead of Stratum v1 */
+#define ARIA_SLICE_BITS 17         /* 2^17 counters per core and slice: about 2 minutes at 1.1 kH/s */
+static int aria;                   /* this connection speaks the AriaPool protocol */
+static struct { char id[96]; uint8_t base[76]; uint64_t start; int height, valid; } ajob;
+static int aria_height; static double aria_keep_t;
 
 /* statistics for the cgminer-compatible API (shares mined for the dev fee are counted apart) */
 typedef struct {
@@ -725,6 +733,21 @@ static int make_work(work_t *w, chain_t *c, const fpga_t *f)
         w->fpga_target = t >= 18446744073709551615.0 ? 0xFFFFFFFFFFFFFFFFULL : (uint64_t)t;
         return 0;
     }
+    if (aria) {
+        if (!have_job || !ajob.valid) return -1;
+        fpga_t *ff = (fpga_t *)f;
+        if (ff->aria_seq != seq) { ff->aria_seq = seq; ff->aria_r = 0; }
+        uint32_t slice = (uint32_t)ff->aria_r * 8 + ((unsigned)(c - chains) & 7);
+        if (slice >= (1u << (25 - ARIA_SLICE_BITS))) return -1;      /* every slice of this job used: wait for the next job */
+        ff->aria_r++;
+        memcpy(w->header, ajob.base, 76);
+        bp_job_state(w->header, w->state);
+        le_put32(w->state + 44, (uint32_t)ajob.start + (slice << ARIA_SLICE_BITS));
+        w->order = 2; w->seq = seq; w->aria = 1; w->nonce_hi = ajob.start >> 32;
+        w->fpga_target = fpga_target_for(c, bp_top64(share_target));
+        snprintf(w->job_id, sizeof w->job_id, "%s", ajob.id);
+        return 0;
+    }
     if (!have_job || !njobs || xn1_len < 0) return -1;
     pjob_t *j = &jobs[njobs - 1];
     uint32_t x2 = xn2_next++;
@@ -765,6 +788,7 @@ static void dispatch_all(void)
  * hash clock), so a job lasts 2^29 / clock (about 3 s at 175 MHz); the next one goes at 80 % */
 static double job_seconds(const fpga_t *f)
 {
+    if (aria) return opt.job_s > 0 && opt.job_s < 60 ? opt.job_s : 30;   /* a slice lasts about 2 minutes */
     if (opt.job_s > 0) return opt.job_s;
     (void)f; return 30;
 }
@@ -783,8 +807,18 @@ static void refresh_jobs(void)
         }
 }
 
-static void submit(const work_t *w, uint32_t nonce)
+static void submit(const work_t *w, uint32_t nonce, const uint8_t hash[32])
 {
+    if (w->aria) {
+        char hx[65], am[400]; int aid = next_id++;
+        hex_of(hash, 32, hx);
+        snprintf(am, sizeof am, "{\"id\":%d,\"method\":\"submit\",\"params\":{\"job_id\":\"%s\",\"nonce\":%llu,\"claimed_hash\":\"%s\"}}\n",
+                 aid, w->job_id, (unsigned long long)(w->nonce_hi << 32 | nonce), hx);
+        if (conn_send(&pool, am) < 0) { logm("pool: send failed"); return; }
+        pend_t *ap = &pend[npend < 64 ? npend++ : (aid % 64)];
+        ap->id = aid; ap->fee = devfee_active; ap->pool = cur_pool; ap->diff = share_diff; ap->order = w->order;
+        return;
+    }
     char x2h[24]; uint8_t xb[8];
     for (int k = 0; k < xn2_size && k < 8; k++) xb[k] = k < 4 ? (uint8_t)(w->xn2 >> (8 * k)) : 0;
     hex_of(xb, xn2_size, x2h);
@@ -830,7 +864,7 @@ static void on_cand(chain_t *c, fpga_t *f, const uint8_t *r)
         if (!devfee_active) { pst[cur_pool].stale++; pst[cur_pool].diff_stale += share_diff; }
         return;
     }
-    submit(w, nonce);
+    submit(w, nonce, h);
 }
 
 static void on_status(chain_t *c, fpga_t *f, int pos)
@@ -1293,6 +1327,43 @@ static void on_notify(cJSON *params)
     logm("pool: job %s%s", j.job_id, clean ? " (clean)" : "");
 }
 
+static void aria_login(void)
+{
+    char msg[700], addr[160], hint[48] = "";
+    const char *u = pool_user(), *dot = strchr(u, '.');
+    snprintf(addr, sizeof addr, "%.*s", dot ? (int)(dot - u) : (int)strlen(u), u);
+    double nom = total_nominal();
+    if (opt.suggest_s > 0 && nom > 0) snprintf(hint, sizeof hint, ",\"difficulty_hint\":%.0f", nom * opt.suggest_s < 1000 ? 1000.0 : nom * opt.suggest_s);
+    snprintf(msg, sizeof msg, "{\"id\":3,\"method\":\"login\",\"params\":{\"address\":\"%s\",\"worker\":\"%s\","
+             "\"capabilities\":[\"submit_claimed_hash\",\"difficulty_hint\"]%s,\"agent\":\"bound-fpga/" VERSION "\"}}\n",
+             addr, dot && dot[1] ? dot + 1 : "blackminer", hint);
+    conn_send(&pool, msg); aria_keep_t = now_s();
+}
+
+/* {"method":"job","params":{"job_id","header_base" (76 bytes),"target" (256-bit number),"difficulty","height","nonce_start","nonce_end"}} */
+static void on_aria_job(const char *line, cJSON *p)
+{
+    const char *hb = cJSON_GetStringValue(cJSON_GetObjectItem(p, "header_base")), *tg = cJSON_GetStringValue(cJSON_GetObjectItem(p, "target")),
+               *ji = cJSON_GetStringValue(cJSON_GetObjectItem(p, "job_id")), *ps = strstr(line, "\"nonce_start\":");
+    cJSON *df = cJSON_GetObjectItem(p, "difficulty"), *hg = cJSON_GetObjectItem(p, "height");
+    uint8_t tb[32], base[76];
+    if (!hb || !tg || !ji || !ps || strlen(hb) != 152 || strlen(tg) != 64 || strlen(ji) >= sizeof ajob.id ||
+        hex_to(hb, base, 76) < 0 || hex_to(tg, tb, 32) < 0) { logm("pool: invalid job"); return; }
+    for (int i = 0; i < 32; i++) share_target[i] = tb[31 - i];           /* the pool writes the number, we keep little-endian bytes */
+    double d = cJSON_IsNumber(df) ? df->valuedouble : 0;
+    if (d > 0 && d != share_diff) { share_diff = d; logm("pool: difficulty %.6g", share_diff); if (!devfee_active) pst[cur_pool & 7].cur_diff = share_diff; }
+    memcpy(ajob.base, base, 76); snprintf(ajob.id, sizeof ajob.id, "%s", ji);
+    ajob.start = strtoull(ps + 14, NULL, 10);                             /* 64 bits: does not fit a double */
+    ajob.height = cJSON_IsNumber(hg) ? hg->valueint : 0; ajob.valid = 1;
+    ++seq; nvalid = 0; valid_seqs[nvalid++] = seq;                        /* one header per connection: the old job is over */
+    pst[cur_pool & 7].getworks++; local_work++;
+    have_job = 1; paused = 0;
+    for (int i = 0; i < nchains; i++) chain_ctrl(&chains[i], 1, 0);
+    dispatch_all();
+    if (ajob.height != aria_height) { aria_height = ajob.height; logm("pool: job %s, new block (height %d)", ajob.id, ajob.height); }
+    else if (opt.verbose) logm("pool: job %s", ajob.id);
+}
+
 static void handle_pool_line(const char *line)
 {
     cJSON *m = cJSON_Parse(line);
@@ -1300,6 +1371,40 @@ static void handle_pool_line(const char *line)
     cJSON *meth = cJSON_GetObjectItem(m, "method");
     cJSON *idj = cJSON_GetObjectItem(m, "id");
     int id = cJSON_IsNumber(idj) ? idj->valueint : -1;
+    {
+        const char *aerr = cJSON_GetStringValue(cJSON_GetObjectItem(m, "error"));
+        if (!aria && opt.proto != 1 && id == 1 && aerr && strstr(aerr, "unknown method")) {
+            aria = 1; logm("pool: not Stratum v1, using the AriaPool protocol"); aria_login(); goto out;
+        }
+        if (aria) {
+            if (cJSON_IsString(meth)) {
+                if (!strcmp(meth->valuestring, "job")) on_aria_job(line, cJSON_GetObjectItem(m, "params"));
+            } else if (id == 3) {
+                if (!aerr) { logm("pool: logged in as %s", pool_user()); pst[cur_pool & 7].alive = 1; pst[cur_pool & 7].tried = 1; }
+                else {
+                    loge("pool: login refused: %s", aerr);
+                    if (!devfee_active) { pst[cur_pool & 7].alive = 0; pst[cur_pool & 7].tried = 1; }
+                    else { logm("dev fee: refused by the pool, window skipped - back to your address"); devfee_abort = 1; }
+                    conn_close(&pool);
+                }
+            } else for (int i = 0; i < npend; i++) if (pend[i].id == id) {
+                pstat_t *ps = &pst[pend[i].pool & 7];
+                if (!aerr && cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(m, "result"), "accepted"))) {
+                    accepted++;
+                    if (pend[i].fee) devfee_accepted++;
+                    else { ps->accepted++; ps->diff_acc += pend[i].diff; ps->last_diff = pend[i].diff; ps->last_share_t = now_s(); }
+                    logm("share accepted%s [%ld/%ld]", pend[i].fee ? " (dev fee)" : "", accepted, accepted + rejected);
+                } else {
+                    rejected++;
+                    if (!pend[i].fee) { ps->rejected++; ps->diff_rej += pend[i].diff; }
+                    logm("share rejected: %s", aerr ? aerr : "?");
+                }
+                pend[i] = pend[--npend];
+                break;
+            }
+            goto out;
+        }
+    }
     if (cJSON_IsString(meth)) {
         cJSON *params = cJSON_GetObjectItem(m, "params");
         if (!strcmp(meth->valuestring, "mining.notify")) {
@@ -1989,6 +2094,8 @@ static void run_pool(void)
             bp_target_from_diff(share_diff = 1, share_target);
             char msg[128];
             snprintf(msg, sizeof msg, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"bound-fpga/%s-boundhash\"]}\n", VERSION);
+            aria = opt.proto == 2; ajob.valid = 0; aria_height = 0;
+            if (aria) { aria_login(); msg[0] = 0; }
             {   /* byte order learned per pool: the fee pool keeps its own */
                 static int ord_user = 0, ord_fee = 0, acc_user, acc_fee, was_fee = -1;
                 if (was_fee >= 0) { if (was_fee) { ord_fee = cur_order; acc_fee = order_accepts; }
@@ -1998,7 +2105,11 @@ static void run_pool(void)
                 cur_order = opt.byteorder ? opt.byteorder : (o ? o : 2);
                 order_accepts = a; order_rejects = 0;
             }
-            conn_send(&pool, msg);
+            if (msg[0]) conn_send(&pool, msg);
+        }
+        if (aria && pool.connected && now_s() - aria_keep_t > 30) {
+            char kb[80]; snprintf(kb, sizeof kb, "{\"id\":%d,\"method\":\"keepalive\",\"params\":{}}\n", next_id++);
+            conn_send(&pool, kb); aria_keep_t = now_s();
         }
         poll_chains(100);
         if (pool.connected) {
@@ -2099,6 +2210,7 @@ static int parse_args(int argc, char **argv, int first)
         else if (!strcmp(a, "--web-freq")) web_freq_ok = 1;
         else if (!strcmp(a, "--vendor-loadfpga")) opt.vendor_loader = 1;
         else if (ARG("--job-s")) opt.job_s = atof(v);
+        else if (ARG("--proto")) opt.proto = !strcmp(v, "aria") ? 2 : !strcmp(v, "stratum") ? 1 : 0;
         else if (ARG("--lines")) { if (bp_set_lines((unsigned)atoi(v))) { fprintf(stderr, "--lines: a power of two from 2 to 1048576\n"); return 2; } }
         else if (ARG("--byteorder")) {
             if (!strcmp(v, "auto")) opt.byteorder = 0; else if (!strcmp(v, "btc")) opt.byteorder = 1;
@@ -2260,7 +2372,8 @@ static void usage(void)
            "  --freq-fpga B:F:MHZ    clock of one FPGA: board B (0..), FPGA F (0..5); repeatable\n"
            "  --overclock            allow a clock above the one the bitstream was built for\n"
            "  --max-cands N          max results/s per board on the serial line (default 50)\n"
-           "  --job-s S              new header for an FPGA every S s (default: 80 %% of a job, 2^29 / clock)\n"
+           "  --job-s S              new work for an FPGA every S s (default 30)\n"
+           "  --proto P              auto (default) | stratum (the bridge) | aria (AriaPool, bound.ariabrain.com:3373)\n"
            "  --byteorder M          stratum fields: auto (default: standard Bitcoin, the other order after\n"
            "                         8+ rejects and > 4 rejects per accepted share), btc, raw (as bound's cpuminer)\n"
            "  --suggest-s S          ask the pool for a difficulty of one share per S s (default 12, 0 = off)\n"

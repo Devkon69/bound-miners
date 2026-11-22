@@ -5,7 +5,7 @@ run/start, service, bm-fan.sh 0.4, bmctl 0.2.2, bm-web 1.5 -> 1.6 (aggiunta la m
 
   python3 build_bbb.py BASE_PROX_BBB.zip BIT CORES MHZ_TETTO MHZ_INIZIO OUT.zip
   es. ... prox-ultra-bbb-nofee.zip ../vivado/out_f1u_7c_90m/bound_f1u.bit 7 90 90 bound-ultra-bbb-nofee.zip
-  env BOUND_FEE (default 3; 0 = senza fee), BOUND_MINER (default ../host_c/bound-miner-armv7-1.1-fee<BOUND_FEE>),
+  env BOUND_FEE (default 3; 0 = senza fee), BOUND_MINER (default ../host_c/bound-miner-armv7-1.2-fee<BOUND_FEE>),
       BOUND_NOTE (riga in piu' nel LEGGIMI)
 
 Attenzione: bm-web prende i MHz del bitstream dal primo "NNN MHz" (tre cifre) del LEGGIMI, altrimenti dalla
@@ -21,7 +21,7 @@ FEE = int(os.environ.get("BOUND_FEE", "3"))
 FEEN = "nofee" if FEE == 0 else "fee%d" % FEE
 NAME = "bound-ultra-bbb-" + FEEN
 DEVFEE_ADDRESS = "BW1chX39ABzxeVgHqqmTDGL5woHd6GAgj2rqVm4iw4Ty5fG7K1Y7"
-POOL = "stratum+tcp://IP_DEL_PC:7340"
+POOL = "stratum+tcp://bound.ariabrain.com:3373"      # AriaPool; in solitaria: stratum+tcp://IP_DEL_PC:7340 (il ponte)
 CPH = 90660
 HPS = cores * mtop * 1e6 / CPH
 
@@ -52,7 +52,7 @@ def ren(s):
 
 f = {}
 EX = "--pool %s --user TUO_INDIRIZZO.ultra1 --freq-max %d --fan-min 20 --fan-max 100" % (POOL, mtop)
-MSG = "metti l'IP del PC col ponte al posto di IP_DEL_PC e il tuo indirizzo BOUND (B...) al posto di TUO_INDIRIZZO"
+MSG = "metti il tuo indirizzo BOUND (B...) al posto di TUO_INDIRIZZO (e, se mini in solitaria, l'IP del PC col ponte al posto di IP_DEL_PC)"
 # ---- bound_run.sh
 f["bound_run.sh"] = must(ren(T("prox_run.sh")), "--freq-file $DIR/freq.json", "/config/bound")
 # ---- bound.service: in conflitto con tutti gli altri miner, anche prox
@@ -86,7 +86,7 @@ assert "AriaPool" not in f["install.sh"] and "TOKEN" not in f["install.sh"]
 # ---- bm-web 1.6: moneta bound (le altre restano)
 s = T("bm-web.py")
 s, k = re.subn(r'(    \("prox",  "Proxima \(PROX\)".*\n)',
-               lambda m: m.group(1) + '    ("bound", "BOUND",                  "BoundHash",         %d, "Mining in solitaria sul proprio nodo: pool = ponte sul PC, stratum+tcp://IP_DEL_PC:7340, utente INDIRIZZO_BOUND.nome. Bitstream %d core BoundHash costruito a %d MHz (circa %.1f kH/s per board): --freq-max %d in bound.conf."),\n' % (mstart, cores, mtop, HPS * 6 / 1000, mtop),
+               lambda m: m.group(1) + '    ("bound", "BOUND",                  "BoundHash",         %d, "In pool: stratum+tcp://bound.ariabrain.com:3373 (AriaPool). In solitaria: pool = ponte sul PC, stratum+tcp://IP_DEL_PC:7340. Utente INDIRIZZO_BOUND.nome. Bitstream %d core BoundHash costruito a %d MHz (circa %.1f kH/s per board): --freq-max %d in bound.conf."),\n' % (mstart, cores, mtop, HPS * 6 / 1000, mtop),
                s, count=1); assert k == 1
 s, k = re.subn(r'VERSION = "1\.5"', 'VERSION = "1.6"', s); assert k == 1
 f["bm-web.py"] = must(s, '("bound"', 'VERSION = "1.6"', '("prox"')
@@ -95,13 +95,13 @@ for n in ("bm-web.html", "bm-web.service", "bm-fan.sh"):
     f[n] = T(n)
 f["fan.conf"] = T("fan.conf").replace("rigor.conf", "bound.conf")
 f["bin/bmctl"] = B("bin/bmctl")
-miner_path = os.environ.get("BOUND_MINER", os.path.join(HC, "bound-miner-armv7-1.1-fee%d" % FEE))
+miner_path = os.environ.get("BOUND_MINER", os.path.join(HC, "bound-miner-armv7-1.2-fee%d" % FEE))
 f["bound-miner"] = open(miner_path, "rb").read()
 if FEE: assert DEVFEE_ADDRESS.encode() in f["bound-miner"], "il miner non contiene l'indirizzo della fee"
 feetxt = ("Nessuna dev fee in questa versione." if FEE == 0 else
           f"Dev fee {FEE} % (dichiarata): {FEE * 60} s ogni 100 minuti il miner lavora per l'indirizzo dello sviluppatore\n"
-          f"{DEVFEE_ADDRESS}: in quella finestra si presenta al tuo ponte con\n"
-          f"quell'indirizzo (serve il ponte di questo repository, con un indirizzo per miner).")
+          f"{DEVFEE_ADDRESS}: in quella finestra si presenta al pool (o al tuo\n"
+          f"ponte) con quell'indirizzo. In solitaria serve il ponte di questo repository, con un indirizzo per miner.")
 f["fpgaminer_top_bound.bit"] = open(bit, "rb").read()
 assert "3001800103752093" in f["fpgaminer_top_bound.bit"][:2048].hex(), "il bitstream non e' per la XC7K420T (F1 Ultra)"
 md = lambda b: hashlib.md5(b if isinstance(b, bytes) else b.encode()).hexdigest()
@@ -112,20 +112,24 @@ Bitstream: {cores} core BoundHash (uno scratchpad da 512 KiB per core, tutto in 
 {cores} x {mtop} MHz / {CPH} clock per hash = {HPS:.0f} H/s per FPGA, circa {HPS * 6 / 1000:.1f} kH/s per board da 6 FPGA.
 (Un i5-10400F fa circa 5,4 kH/s con tutti i thread.) Le velocita' sono in H/s e kH/s, non in GH/s.
 {note}
-bound-miner 1.1 (da rigor-miner / csd-miner 1.4.5: frequenza al volo, profili Giorno / Notte),
+bound-miner 1.2 (pool AriaPool oppure il proprio ponte; frequenza al volo, profili Giorno / Notte),
 bm-web 1.6, bm-fan.sh 0.4, bmctl 0.2.2.
 {feetxt}
 
-BOUND non ha pool: si mina in solitaria sul proprio nodo. Sul PC servono il nodo con la patch
-(node_patch/LEGGIMI_NODO.md) e il ponte (pc_bridge/LEGGIMI_PC.md, porta 7340); la macchina si collega al ponte:
+Due modi di minare (il miner riconosce da solo quale dei due c'e' dall'altra parte):
+A. In pool su AriaPool (https://pool.ariabrain.com), senza altro da installare:
       --pool {POOL} --user TUO_INDIRIZZO.ultra1
-      IP_DEL_PC = indirizzo del PC col ponte; TUO_INDIRIZZO = il tuo indirizzo BOUND (B...); ultra1 = nome.
-Le share servono solo a misurare l'hashrate: paga solo il blocco intero, quando il ponte scrive BLOCCO ACCETTATO.
+      TUO_INDIRIZZO = il tuo indirizzo BOUND (B...); ultra1 = nome. Il pool usa un protocollo suo, non Stratum:
+      va solo con bound-miner 1.2 o piu' nuovo. I conti si vedono sulla pagina del pool.
+B. In solitaria sul proprio nodo: sul PC servono il nodo con la patch (node/LEGGIMI_NODO.md) e il ponte
+   (bridge/LEGGIMI_PC.md, porta 7340):
+      --pool stratum+tcp://IP_DEL_PC:7340 --user TUO_INDIRIZZO.ultra1
+   Le share servono solo a misurare l'hashrate: paga solo il blocco intero (il ponte scrive BLOCCO ACCETTATO).
 
 Installazione (sulla BBB):
   unzip {NAME}.zip && cd {NAME} && sudo sh install.sh
-  sudo sh /config/bound/bound_start.sh bench 60      prova degli FPGA senza nodo ne' ponte (errori HW = 0?)
-  sudo nano /config/bound/bound.conf     metti l'IP del PC e il tuo indirizzo
+  sudo sh /config/bound/bound_start.sh bench 60      prova degli FPGA senza rete (errori HW = 0?)
+  sudo nano /config/bound/bound.conf     metti il tuo indirizzo (e l'IP del PC, se usi il ponte)
   sudo sh /config/bound/bound_start.sh start         mining (ferma gli altri miner)
   sudo sh /config/bound/bound_start.sh enable        avvio automatico
   sudo sh /config/bound/bound_start.sh log
@@ -140,8 +144,8 @@ Il consumo e' contenuto (circa 50 W per hash board): scendere di frequenza non s
 bm-web 1.6: http://IP_BBB/ (scheda Miner: moneta BOUND). Log: journalctl -u bound -f.
 
 md5: bitstream {md(f["fpgaminer_top_bound.bit"])}, bound-miner {md(f["bound-miner"])}.
-Bitstream e miner 1.0 provati in macchina (18/11: circa 50 kH/s e 50 W per board); la 1.1
-aggiunge solo la dev fee. Nel bench guarda "6 FPGA" per board, "verified results" e "hardware errors";
+Bitstream e miner 1.0 provati in macchina (18/11: circa 50 kH/s e 50 W per board); la 1.1 aggiunge la dev fee,
+la 1.2 il pool AriaPool (provato contro il pool vero con FPGA emulati, non ancora in macchina). Nel bench guarda "6 FPGA" per board, "verified results" e "hardware errors";
 in mining "pool: job", "share accepted" ed eventuali "hardware error".
 """
 assert not re.search(r"\d{3} MHz", f["LEGGIMI.txt"]), "nel LEGGIMI c'e' un 'NNN MHz' a tre cifre: bm-web lo prenderebbe per il clock del bitstream"

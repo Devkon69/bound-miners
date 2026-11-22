@@ -8,7 +8,8 @@ di BOUND (hash con etichetta invece di sha256d), velocita' in H/s (un core fa ~1
 core x MHz x 10^6 / 90660), lavoro che non si esaurisce (si rinnova ogni --job-s, default 30 s), ordine
 dei byte "raw" fisso (lo stratum e' quello di pc_bridge/bound_bridge.py), tetto del clock = build + 15 MHz,
 --max-cands 4 (ogni candidato costa un BoundHash sull'ARM), opzione --lines per le prove su regtest,
-dev fee 3 % sullo stesso ponte dell'utente con l'indirizzo dello sviluppatore (bound-miner 1.1).
+dev fee 3 % sullo stesso ponte dell'utente con l'indirizzo dello sviluppatore (bound-miner 1.1),
+protocollo di AriaPool oltre allo Stratum del ponte (bound-miner 1.2).
 Tutto il resto (catena, ventole, clock DRP, web, API, loader, profili, fee) resta com'e'.
 """
 import sys, re
@@ -89,6 +90,9 @@ rep('int freq_max;               /* --freq-max: ceiling for the hash clock (0 = 
 
 # ---- default e opzione --lines
 rep('opt.status_s = 1; opt.max_cands = 50;', 'opt.status_s = 1; opt.max_cands = 4;')
+rep('           "  --job-s S              new header for an FPGA every S s (default: 80 %% of a job, 2^29 / clock)\\n"',
+    '           "  --job-s S              new work for an FPGA every S s (default 30)\\n"\n'
+    '           "  --proto P              auto (default) | stratum (the bridge) | aria (AriaPool, bound.ariabrain.com:3373)\\n"')
 rep('        else if (ARG("--job-s")) opt.job_s = atof(v);',
     '        else if (ARG("--job-s")) opt.job_s = atof(v);\n'
     '        else if (ARG("--lines")) { if (bp_set_lines((unsigned)atoi(v))) { fprintf(stderr, "--lines: a power of two from 2 to 1048576\\n"); return 2; } }')
@@ -135,6 +139,164 @@ for a, b in (('--user rg1q...[.rig]   ORU payout address', '--user B....[.rig]  
              ('logm("pool: difficulty %.3f", share_diff);', 'logm("pool: difficulty %.6g", share_diff);')):
     assert s.count(a) == 1, a
     s = s.replace(a, b)
+
+# ==== bound-miner 1.2: protocollo di AriaPool (bound.ariabrain.com:3373), riconosciuto da solo ====
+# Non e' Stratum v1: login / job / submit con claimed_hash (descrizione e pool finto in gpu/tools/mock_ariapool.py).
+# Il pool da' UN header per connessione e 2^32 nonce: tutti gli FPGA lavorano sullo stesso header, ognuno su una
+# fetta diversa dei contatori (nonce = base + {core, posizione, contatore}: la base sposta il contatore di
+# fetta * 2^17, fetta = rinnovo * 8 + numero della board), cosi' nessun nonce viene provato due volte.
+rep('#define VERSION "1.1"', '#define VERSION "1.2"')
+rep('    int have_status, flags, job_id, drops, addr;', '    int have_status, flags, job_id, drops, addr;\n    long aria_seq; int aria_r;       /* AriaPool: nonce slices taken from the current job */')
+rep('    double job_s;               /* new job for an FPGA after this many seconds (0 = 30 s) */',
+    '    double job_s;               /* new job for an FPGA after this many seconds (0 = 30 s) */\n    int proto;                  /* 0 auto, 1 stratum, 2 AriaPool */')
+rep('''    long seq;
+    int bench;''', '''    long seq;
+    int aria; uint64_t nonce_hi;     /* AriaPool: job nonce = nonce_hi << 32 | header nonce */
+    int bench;''')
+rep('typedef struct { int id, fee, pool, order; double diff; } pend_t;', '''typedef struct { int id, fee, pool, order; double diff; } pend_t;
+/* AriaPool (bound.ariabrain.com): its own JSON protocol instead of Stratum v1 */
+#define ARIA_SLICE_BITS 17         /* 2^17 counters per core and slice: about 2 minutes at 1.1 kH/s */
+static int aria;                   /* this connection speaks the AriaPool protocol */
+static struct { char id[96]; uint8_t base[76]; uint64_t start; int height, valid; } ajob;
+static int aria_height; static double aria_keep_t;''')
+rep('''    if (!have_job || !njobs || xn1_len < 0) return -1;
+    pjob_t *j = &jobs[njobs - 1];''', '''    if (aria) {
+        if (!have_job || !ajob.valid) return -1;
+        fpga_t *ff = (fpga_t *)f;
+        if (ff->aria_seq != seq) { ff->aria_seq = seq; ff->aria_r = 0; }
+        uint32_t slice = (uint32_t)ff->aria_r * 8 + ((unsigned)(c - chains) & 7);
+        if (slice >= (1u << (25 - ARIA_SLICE_BITS))) return -1;      /* every slice of this job used: wait for the next job */
+        ff->aria_r++;
+        memcpy(w->header, ajob.base, 76);
+        bp_job_state(w->header, w->state);
+        le_put32(w->state + 44, (uint32_t)ajob.start + (slice << ARIA_SLICE_BITS));
+        w->order = 2; w->seq = seq; w->aria = 1; w->nonce_hi = ajob.start >> 32;
+        w->fpga_target = fpga_target_for(c, bp_top64(share_target));
+        snprintf(w->job_id, sizeof w->job_id, "%s", ajob.id);
+        return 0;
+    }
+    if (!have_job || !njobs || xn1_len < 0) return -1;
+    pjob_t *j = &jobs[njobs - 1];''')
+rep('''    if (opt.job_s > 0) return opt.job_s;
+    (void)f; return 30;''', '''    if (aria) return opt.job_s > 0 && opt.job_s < 60 ? opt.job_s : 30;   /* a slice lasts about 2 minutes */
+    if (opt.job_s > 0) return opt.job_s;
+    (void)f; return 30;''')
+rep('''static void submit(const work_t *w, uint32_t nonce)
+{
+    char x2h[24]; uint8_t xb[8];''', '''static void submit(const work_t *w, uint32_t nonce, const uint8_t hash[32])
+{
+    if (w->aria) {
+        char hx[65], am[400]; int aid = next_id++;
+        hex_of(hash, 32, hx);
+        snprintf(am, sizeof am, "{\\"id\\":%d,\\"method\\":\\"submit\\",\\"params\\":{\\"job_id\\":\\"%s\\",\\"nonce\\":%llu,\\"claimed_hash\\":\\"%s\\"}}\\n",
+                 aid, w->job_id, (unsigned long long)(w->nonce_hi << 32 | nonce), hx);
+        if (conn_send(&pool, am) < 0) { logm("pool: send failed"); return; }
+        pend_t *ap = &pend[npend < 64 ? npend++ : (aid % 64)];
+        ap->id = aid; ap->fee = devfee_active; ap->pool = cur_pool; ap->diff = share_diff; ap->order = w->order;
+        return;
+    }
+    char x2h[24]; uint8_t xb[8];''')
+rep('    submit(w, nonce);', '    submit(w, nonce, h);')
+rep('''static void handle_pool_line(const char *line)
+{
+    cJSON *m = cJSON_Parse(line);
+    if (!m) { logm("pool: unparsable line: %.120s", line); return; }
+    cJSON *meth = cJSON_GetObjectItem(m, "method");
+    cJSON *idj = cJSON_GetObjectItem(m, "id");
+    int id = cJSON_IsNumber(idj) ? idj->valueint : -1;''', '''static void aria_login(void)
+{
+    char msg[700], addr[160], hint[48] = "";
+    const char *u = pool_user(), *dot = strchr(u, '.');
+    snprintf(addr, sizeof addr, "%.*s", dot ? (int)(dot - u) : (int)strlen(u), u);
+    double nom = total_nominal();
+    if (opt.suggest_s > 0 && nom > 0) snprintf(hint, sizeof hint, ",\\"difficulty_hint\\":%.0f", nom * opt.suggest_s < 1000 ? 1000.0 : nom * opt.suggest_s);
+    snprintf(msg, sizeof msg, "{\\"id\\":3,\\"method\\":\\"login\\",\\"params\\":{\\"address\\":\\"%s\\",\\"worker\\":\\"%s\\","
+             "\\"capabilities\\":[\\"submit_claimed_hash\\",\\"difficulty_hint\\"]%s,\\"agent\\":\\"bound-fpga/" VERSION "\\"}}\\n",
+             addr, dot && dot[1] ? dot + 1 : "blackminer", hint);
+    conn_send(&pool, msg); aria_keep_t = now_s();
+}
+
+/* {"method":"job","params":{"job_id","header_base" (76 bytes),"target" (256-bit number),"difficulty","height","nonce_start","nonce_end"}} */
+static void on_aria_job(const char *line, cJSON *p)
+{
+    const char *hb = cJSON_GetStringValue(cJSON_GetObjectItem(p, "header_base")), *tg = cJSON_GetStringValue(cJSON_GetObjectItem(p, "target")),
+               *ji = cJSON_GetStringValue(cJSON_GetObjectItem(p, "job_id")), *ps = strstr(line, "\\"nonce_start\\":");
+    cJSON *df = cJSON_GetObjectItem(p, "difficulty"), *hg = cJSON_GetObjectItem(p, "height");
+    uint8_t tb[32], base[76];
+    if (!hb || !tg || !ji || !ps || strlen(hb) != 152 || strlen(tg) != 64 || strlen(ji) >= sizeof ajob.id ||
+        hex_to(hb, base, 76) < 0 || hex_to(tg, tb, 32) < 0) { logm("pool: invalid job"); return; }
+    for (int i = 0; i < 32; i++) share_target[i] = tb[31 - i];           /* the pool writes the number, we keep little-endian bytes */
+    double d = cJSON_IsNumber(df) ? df->valuedouble : 0;
+    if (d > 0 && d != share_diff) { share_diff = d; logm("pool: difficulty %.6g", share_diff); if (!devfee_active) pst[cur_pool & 7].cur_diff = share_diff; }
+    memcpy(ajob.base, base, 76); snprintf(ajob.id, sizeof ajob.id, "%s", ji);
+    ajob.start = strtoull(ps + 14, NULL, 10);                             /* 64 bits: does not fit a double */
+    ajob.height = cJSON_IsNumber(hg) ? hg->valueint : 0; ajob.valid = 1;
+    ++seq; nvalid = 0; valid_seqs[nvalid++] = seq;                        /* one header per connection: the old job is over */
+    pst[cur_pool & 7].getworks++; local_work++;
+    have_job = 1; paused = 0;
+    for (int i = 0; i < nchains; i++) chain_ctrl(&chains[i], 1, 0);
+    dispatch_all();
+    if (ajob.height != aria_height) { aria_height = ajob.height; logm("pool: job %s, new block (height %d)", ajob.id, ajob.height); }
+    else if (opt.verbose) logm("pool: job %s", ajob.id);
+}
+
+static void handle_pool_line(const char *line)
+{
+    cJSON *m = cJSON_Parse(line);
+    if (!m) { logm("pool: unparsable line: %.120s", line); return; }
+    cJSON *meth = cJSON_GetObjectItem(m, "method");
+    cJSON *idj = cJSON_GetObjectItem(m, "id");
+    int id = cJSON_IsNumber(idj) ? idj->valueint : -1;
+    {
+        const char *aerr = cJSON_GetStringValue(cJSON_GetObjectItem(m, "error"));
+        if (!aria && opt.proto != 1 && id == 1 && aerr && strstr(aerr, "unknown method")) {
+            aria = 1; logm("pool: not Stratum v1, using the AriaPool protocol"); aria_login(); goto out;
+        }
+        if (aria) {
+            if (cJSON_IsString(meth)) {
+                if (!strcmp(meth->valuestring, "job")) on_aria_job(line, cJSON_GetObjectItem(m, "params"));
+            } else if (id == 3) {
+                if (!aerr) { logm("pool: logged in as %s", pool_user()); pst[cur_pool & 7].alive = 1; pst[cur_pool & 7].tried = 1; }
+                else {
+                    loge("pool: login refused: %s", aerr);
+                    if (!devfee_active) { pst[cur_pool & 7].alive = 0; pst[cur_pool & 7].tried = 1; }
+                    else { logm("dev fee: refused by the pool, window skipped - back to your address"); devfee_abort = 1; }
+                    conn_close(&pool);
+                }
+            } else for (int i = 0; i < npend; i++) if (pend[i].id == id) {
+                pstat_t *ps = &pst[pend[i].pool & 7];
+                if (!aerr && cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(m, "result"), "accepted"))) {
+                    accepted++;
+                    if (pend[i].fee) devfee_accepted++;
+                    else { ps->accepted++; ps->diff_acc += pend[i].diff; ps->last_diff = pend[i].diff; ps->last_share_t = now_s(); }
+                    logm("share accepted%s [%ld/%ld]", pend[i].fee ? " (dev fee)" : "", accepted, accepted + rejected);
+                } else {
+                    rejected++;
+                    if (!pend[i].fee) { ps->rejected++; ps->diff_rej += pend[i].diff; }
+                    logm("share rejected: %s", aerr ? aerr : "?");
+                }
+                pend[i] = pend[--npend];
+                break;
+            }
+            goto out;
+        }
+    }''')
+rep('''            snprintf(msg, sizeof msg, "{\\"id\\":1,\\"method\\":\\"mining.subscribe\\",\\"params\\":[\\"bound-fpga/%s-boundhash\\"]}\\n", VERSION);''',
+    '''            snprintf(msg, sizeof msg, "{\\"id\\":1,\\"method\\":\\"mining.subscribe\\",\\"params\\":[\\"bound-fpga/%s-boundhash\\"]}\\n", VERSION);
+            aria = opt.proto == 2; ajob.valid = 0; aria_height = 0;
+            if (aria) { aria_login(); msg[0] = 0; }''')
+rep('''            conn_send(&pool, msg);
+        }
+        poll_chains(100);''', '''            if (msg[0]) conn_send(&pool, msg);
+        }
+        if (aria && pool.connected && now_s() - aria_keep_t > 30) {
+            char kb[80]; snprintf(kb, sizeof kb, "{\\"id\\":%d,\\"method\\":\\"keepalive\\",\\"params\\":{}}\\n", next_id++);
+            conn_send(&pool, kb); aria_keep_t = now_s();
+        }
+        poll_chains(100);''')
+rep('''        else if (ARG("--job-s")) opt.job_s = atof(v);''', '''        else if (ARG("--job-s")) opt.job_s = atof(v);
+        else if (ARG("--proto")) opt.proto = !strcmp(v, "aria") ? 2 : !strcmp(v, "stratum") ? 1 : 0;''')
+
 assert 'RGR' not in s and 'rigor' not in s.lower(), [l for l in s.splitlines() if 'rigor' in l.lower() or 'RGR' in l][:5]
 open(dst, 'w').write(s)
 print("bound_main.c: %d sostituzioni verificate, %d righe" % (n_rep, s.count('\n')))
