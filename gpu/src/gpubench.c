@@ -19,7 +19,7 @@
 #include <stdarg.h>
 #include "bound_pow.h"
 #include "kernel_ptx.h"
-#define VERSION "0.2"
+#define VERSION "0.3"
 #include "gpu_common.h"
 
 /* gli hash della GPU contro bound_pow.c: `check` thread sparsi nel lancio, e la lista dei trovati */
@@ -152,7 +152,10 @@ int main(int argc, char **argv)
     /* 1. controllo: prima un lancio piccolo (se il kernel fosse lento, un lancio grande farebbe scattare il
      *    timeout del driver video), poi uno pieno */
     g.block = one_block ? one_block : 64;
+    if (one_block && maxb >= one_block) maxb = maxb / one_block * one_block;   /* anche il lancio pieno multiplo del blocco */
     unsigned small = maxb < 1024 ? (unsigned)maxb : 1024;
+    small = small / g.block * g.block;              /* multiplo del blocco: con 96 o 192 thread 1024 non lo e' (0.2: falso "hash diversi") */
+    if (!small) small = g.block;
     int bad = check_launch(&g, small, check < small ? check : small);
     if (bad < 0) return 1;
     double quick = measure(&g, small, 1.0);

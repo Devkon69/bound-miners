@@ -1,5 +1,7 @@
-bound-gpuminer 0.4 - miner CUDA per BOUND (BoundHash) - 22/11/2026
-==================================================================
+bound-gpuminer 0.5 - miner CUDA (e CPU) per BOUND (BoundHash) - 23/11/2026
+==========================================================================
+NOVITA' 0.5: puo' minare ANCHE CON LA CPU, insieme alla GPU (--cpu) o da sola (--no-gpu). Senza --cpu mina solo
+con la GPU, come prima. Vedi "GPU + CPU" sotto.
 NOVITA' 0.4: mining in POOL su AriaPool (bound.ariabrain.com:3373) oltre che in solitaria col ponte;
 taratura automatica degli hash in volo (--tune); senza --batch il miner usa 8192 hash in volo o, se la
 VRAM libera non basta, quanti ce ne stanno (prima si fermava).
@@ -39,6 +41,21 @@ Cosa si vede
   *** BLOCCO N ACCETTATO.  "errori GPU" deve restare 0: ogni nonce e' ricalcolato sulla CPU prima di mandarlo.
   Tutto finisce anche in bound-gpuminer.log.
 
+GPU + CPU
+  BoundHash sulla CPU rende bene: lo scratchpad di un hash (512 KiB) sta nelle cache del processore, quindi non
+  conta la RAM ma i core. Il miner usa AVX-512 o AVX2 (sceglie da solo) e fa calcolare a ogni thread 2-4 hash
+  insieme, cosi' i calcoli di uno coprono le attese dell'altro.
+  Misurato su un core di un Ryzen 9 7950X3D (2 thread): circa 15 kH/s col bench; sul pool vero, in sola CPU,
+  22 kH/s con 32 share accettate e 0 rifiutate. Con tutti i 16 core ci si aspettano piu' o meno 150-200 kH/s
+  oltre ai circa 349 della RTX 4090: il numero vero lo da' taratura_cpu.bat.
+    avvia_pool_gpu_cpu.bat    GPU + CPU sul pool (metti il tuo indirizzo)
+    taratura_cpu.bat          prova le combinazioni di thread e hash per thread (circa 40 s), poi misura GPU + CPU
+                              insieme per 30 s; alla fine scrive i valori da mettere in avvia_pool_gpu_cpu.bat
+  GPU e CPU prendono i nonce dallo stesso contatore (nessun nonce provato due volte); i thread CPU hanno priorita'
+  bassa, cosi' la GPU non resta mai senza lavoro. Ogni share della CPU viene ricontrollata prima di mandarla.
+  La riga ogni 10 s diventa:  520.3 kH/s = GPU 348.9 + CPU 171.4 (media ...) | share ...
+  Attenzione: con la CPU al 100 % il PC consuma e scalda di piu' (il 7950X3D e' da 120 W di TDP).
+
 Opzioni
   --gpu N          scheda (default 0; per piu' schede, per ora, un miner per scheda con --gpu diversi)
   --batch N        hash in volo (default 8192 = 4 GiB di VRAM, il valore migliore misurato sulla 4090; se la VRAM
@@ -46,6 +63,10 @@ Opzioni
   --tune           all'avvio prova da 2048 a 16384 hash in volo (10 s), stampa i kH/s di ognuno e usa il migliore:
                    da usare una volta su ogni scheda diversa dalla 4090, poi si mette il valore in --batch
   --proto X        auto (default) | aria (AriaPool) | stratum (ponte)        --diff N   difficolta' chiesta al pool
+  --cpu N|auto     mina anche con la CPU: N thread (auto = tutti i thread logici meno uno)
+  --cpu-lanes L    hash calcolati insieme da ogni thread CPU, 1..4 (default 3)
+  --tune-cpu       all'avvio prova 3 numeri di thread x 1..4 hash (circa 40 s) e usa la combinazione migliore
+  --no-gpu         solo la CPU (anche su un PC senza scheda NVIDIA)
   --block N        thread per blocco (default 128)
   --share-s S      secondi tra le share (default 10)
   --bench S        solo la velocita'

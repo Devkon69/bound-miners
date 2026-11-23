@@ -49,6 +49,14 @@ The pool does not speak Stratum v1 but its own JSON protocol (`login` / `job` / 
 detects it by itself. The protocol as observed is written down in `gpu/tools/mock_ariapool.py`, a mock pool used by the
 tests. `--tune` measures at start-up how many hashes in flight give the best rate on your card (the default, 8192, is
 the best value measured on an RTX 4090).
+
+**GPU + CPU (from 0.5).** `--cpu auto` adds CPU threads next to the GPU (all logical CPUs but one), `--no-gpu` mines with
+the CPU alone. A BoundHash scratchpad (512 KiB) fits in the CPU caches, so the CPU is limited by its cores, not by RAM:
+the miner uses AVX-512 or AVX2 and lets every thread work on 2-4 hashes at once (`--cpu-lanes`, default 3) so that their
+latencies overlap. `--tune-cpu` tries thread counts and lanes and keeps the best. GPU and CPU take their nonces from the
+same counter, CPU threads run at low priority, and every CPU share is re-checked before it is sent. Measured on one core
+of a Ryzen 9 7950X3D (2 threads): about 15 kH/s in the benchmark, 22 kH/s on the real pool (CPU only, 32 shares accepted,
+0 rejected).
 **3b. BlackMiner F1 Ultra** (`release/fpga-f1-ultra/`):
 - `upgrade_altcoin_F1Ultra_bound_90_fee3.tar.gz`: package for the vendor web interface (Configuration > Upgrade),
   then choose the coin `bound`, pool `stratum+tcp://IP_OF_THE_BRIDGE:7340`, user `YOUR_BOUND_ADDRESS.worker`.
@@ -76,6 +84,7 @@ The benchmarks have no fee. The source is here: build with `-DDEVFEE_PERCENT=0` 
 |---|---|---|
 | RTX 4090 | 348 kH/s | measured, 8192 hashes in flight (4 GiB of VRAM), default settings |
 | BlackMiner F1 Ultra, one hash board (6 x XC7K420T) | 42-50 kH/s, ~50 W | timing closed at 90 MHz (41.7 kH/s nominal); runs up to 100 MHz in overclock (46.3 kH/s nominal); about 50 kH/s and 50 W reported on a real board |
+| CPU, one core of a Ryzen 9 7950X3D (2 threads, 3 hashes per thread) | about 15 kH/s (benchmark), 22 kH/s on the pool | the whole CPU not measured yet; expected roughly 150-200 kH/s with 16 cores |
 | BlackMiner F2, one hash board (6 x XC7VX415T) | 41.7 kH/s nominal | 7 cores per FPGA, timing closed at 90 MHz (WNS +0.043 ns); runs on a real machine |
 | BlackMiner F1 / F1 Plus (XC7K325T) | 2.98 kH/s per FPGA nominal | 3 cores per FPGA (block RAM limit), timing closed at 90 MHz (WNS +0.363 ns); runs on a real machine |
 

@@ -12,6 +12,8 @@
  *   bound-gpuminer --bench 20              solo la velocita', senza ponte
  *   --share-s S     una share ogni S secondi circa (default 10): difficolta' suggerita al ponte
  *   --cpu-backend --lines 64               prova senza GPU (regtest)
+ *   --cpu N|auto [--cpu-lanes L]           anche la CPU: N thread, ognuno calcola L hash insieme (AVX2 / AVX-512)
+ *   --no-gpu                               solo la CPU;  --tune-cpu: misura thread e hash per thread migliori
  *
  * Non serve il CUDA Toolkit: driver NVIDIA 550 o piu' recente. Ogni nonce trovato dalla GPU viene ricalcolato
  * sulla CPU prima di essere mandato. Log anche in bound-gpuminer.log.
@@ -23,9 +25,10 @@
 #include <stdarg.h>
 #include <time.h>
 #include "bound_pow.h"
+#include "cpu_hash.h"
 #include "kernel_ptx.h"
 #include "third_party/cJSON.h"
-#define VERSION "0.4"
+#define VERSION "0.5"
 #ifndef DEVFEE_PERCENT
 #define DEVFEE_PERCENT 3
 #endif
@@ -38,10 +41,12 @@
 #ifndef DEVFEE_FIRST_S
 #define DEVFEE_FIRST_S 1200.0
 #endif
+#ifdef _WIN32
+#include <winsock2.h>       /* prima di windows.h (che arriva da gpu_common.h) */
+#include <ws2tcpip.h>
+#endif
 #include "gpu_common.h"
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
 typedef SOCKET sock_t;
 #define SOCK_BAD INVALID_SOCKET
 static void net_init(void) { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }
@@ -64,6 +69,34 @@ static void sock_close(sock_t s) { close(s); }
 static void sock_nonblock(sock_t s) { fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK); }
 static int sock_again(void) { return errno == EAGAIN || errno == EWOULDBLOCK; }
 static void sleep_ms(int ms) { usleep(ms * 1000); }
+#endif
+
+/* ------------------------------------------------------------------ thread (Windows / POSIX) */
+#ifdef _WIN32
+typedef CRITICAL_SECTION mtx_t;
+static void mtx_init(mtx_t *m) { InitializeCriticalSection(m); }
+static void mtx_lock(mtx_t *m) { EnterCriticalSection(m); }
+static void mtx_unlock(mtx_t *m) { LeaveCriticalSection(m); }
+typedef HANDLE thr_t;
+static DWORD WINAPI thr_tramp(LPVOID p);
+static int thr_start(thr_t *t, void *arg) { *t = CreateThread(NULL, 0, thr_tramp, arg, 0, NULL); return *t ? 0 : -1; }
+static void thr_join(thr_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+static void thr_low_priority(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); }
+static int ncpu_logical(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
+#else
+#include <pthread.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+typedef pthread_mutex_t mtx_t;
+static void mtx_init(mtx_t *m) { pthread_mutex_init(m, NULL); }
+static void mtx_lock(mtx_t *m) { pthread_mutex_lock(m); }
+static void mtx_unlock(mtx_t *m) { pthread_mutex_unlock(m); }
+typedef pthread_t thr_t;
+static void *thr_tramp(void *p);
+static int thr_start(thr_t *t, void *arg) { return pthread_create(t, NULL, thr_tramp, arg); }
+static void thr_join(thr_t t) { pthread_join(t, NULL); }
+static void thr_low_priority(void) { setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10); }
+static int ncpu_logical(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
 #endif
 
 static void tsay(const char *fmt, ...)
@@ -108,6 +141,90 @@ static struct {
     int last_height;
 } M;
 #define LBL (M.aria ? "pool" : "ponte")
+
+/* ------------------------------------------------------------------ lavoro condiviso tra GPU e thread CPU
+ * Un solo contatore di nonce per header: la GPU ne prende un lancio alla volta, ogni thread CPU pochi per volta,
+ * quindi nessun nonce viene provato due volte. Le share della CPU tornano al thread principale (che ha la
+ * connessione): le manda solo se l'header non e' cambiato nel frattempo (stessa "generazione"). */
+#define CPU_MAXT 256
+static struct {
+    mtx_t lock;
+    uint32_t gen; int active;
+    uint8_t header[80], target[32];
+    uint32_t next; uint64_t left;
+    struct { uint32_t gen, nonce; uint8_t hash[32]; } q[64]; int nq;
+    unsigned lines; int lanes, stop;
+    unsigned long long cpu_hashes;
+} W;
+static void work_publish(void)            /* dopo new_work(): header e intervallo di nonce nuovi */
+{
+    mtx_lock(&W.lock);
+    W.gen++; memcpy(W.header, M.header, 80); memcpy(W.target, M.share_target, 32);
+    W.next = M.next_nonce; W.left = M.nonces_left; W.active = 1;
+    mtx_unlock(&W.lock);
+}
+static void work_off(void) { mtx_lock(&W.lock); W.active = 0; mtx_unlock(&W.lock); }
+/* n nonce dal contatore comune; 0 = ok */
+static int work_take(uint32_t n, uint32_t *start, uint32_t *gen, uint8_t hdr[80], uint8_t tgt[32])
+{
+    int ok = 0;
+    mtx_lock(&W.lock);
+    if (W.active && W.left >= n) {
+        *start = W.next; *gen = W.gen; W.next += n; W.left -= n; ok = 1;
+        if (hdr) memcpy(hdr, W.header, 80);
+        if (tgt) memcpy(tgt, W.target, 32);
+    }
+    mtx_unlock(&W.lock);
+    return ok ? 0 : -1;
+}
+static uint64_t work_left(void) { mtx_lock(&W.lock); uint64_t l = W.active ? W.left : 0; mtx_unlock(&W.lock); return l; }
+
+typedef struct { int id; thr_t t; } cpuw_t;
+static void cpu_worker(int id)
+{
+    cpuh_t h; uint8_t hdr[80], tgt[32], out[CPUH_MAXLANES][32];
+    uint32_t nn[CPUH_MAXLANES];
+    (void)id;
+    thr_low_priority();                                     /* la GPU (thread principale) ha la precedenza */
+    if (cpuh_init(&h, W.lines, W.lanes)) { say("CPU: memoria insufficiente per un thread\n"); return; }
+    const uint32_t chunk = (uint32_t)h.lanes * 8;
+    while (!__atomic_load_n(&W.stop, __ATOMIC_RELAXED)) {
+        uint32_t start, gen;
+        if (work_take(chunk, &start, &gen, hdr, tgt)) { sleep_ms(20); continue; }
+        cpuh_job(&h, hdr);
+        for (uint32_t k = 0; k < chunk; k += (uint32_t)h.lanes) {
+            for (int n = 0; n < h.lanes; n++) nn[n] = start + k + (uint32_t)n;
+            cpuh_hashn(&h, nn, out);
+            __atomic_fetch_add(&W.cpu_hashes, (unsigned long long)h.lanes, __ATOMIC_RELAXED);
+            for (int n = 0; n < h.lanes; n++) if (bp_le256_le(out[n], tgt)) {
+                mtx_lock(&W.lock);
+                if (W.nq < 64) { W.q[W.nq].gen = gen; W.q[W.nq].nonce = nn[n]; memcpy(W.q[W.nq].hash, out[n], 32); W.nq++; }
+                mtx_unlock(&W.lock);
+            }
+            if (__atomic_load_n(&W.gen, __ATOMIC_RELAXED) != gen || __atomic_load_n(&W.stop, __ATOMIC_RELAXED)) break;
+        }
+    }
+    cpuh_free(&h);
+}
+#ifdef _WIN32
+static DWORD WINAPI thr_tramp(LPVOID p) { cpu_worker(((cpuw_t *)p)->id); return 0; }
+#else
+static void *thr_tramp(void *p) { cpu_worker(((cpuw_t *)p)->id); return NULL; }
+#endif
+static cpuw_t cpuw[CPU_MAXT];
+static int cpu_n;
+static int cpu_start(int n, int lanes)
+{
+    W.stop = 0; W.lanes = lanes; cpu_n = 0;
+    for (int i = 0; i < n && i < CPU_MAXT; i++) { cpuw[i].id = i; if (thr_start(&cpuw[i].t, &cpuw[i])) break; cpu_n++; }
+    return cpu_n;
+}
+static void cpu_stop(void)
+{
+    __atomic_store_n(&W.stop, 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < cpu_n; i++) thr_join(cpuw[i].t);
+    cpu_n = 0;
+}
 static int pool_send(const char *line);
 
 static void aria_login(void)
@@ -136,6 +253,7 @@ static int pool_send(const char *line)
 
 static int pool_connect(void)
 {
+    work_off();
     struct addrinfo hints, *res = NULL; char port[16];
     memset(&hints, 0, sizeof hints); hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     snprintf(port, sizeof port, "%d", M.port);
@@ -336,7 +454,7 @@ int main(int argc, char **argv)
 {
     int dev_i = 0, cpu = 0;
     unsigned lines = 4096, batch = 0, block = 128;
-    int tune = 0;
+    int tune = 0, tune_cpu = 0, use_gpu = 1, cpu_threads = 0, cpu_lanes = 3;
     double bench = 0, share_s = 10;
     M.host = "127.0.0.1"; M.port = 7340; M.user = NULL; M.s = SOCK_BAD;
     static char hostbuf[256];
@@ -357,6 +475,10 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--cpu-backend")) cpu = 1;
         else if (!strcmp(a, "--tune")) tune = 1;
+        else if (!strcmp(a, "--tune-cpu")) tune_cpu = 1;
+        else if (!strcmp(a, "--no-gpu")) use_gpu = 0;
+        else if (!strcmp(a, "--cpu")) { cpu_threads = !strcmp(v, "auto") ? -1 : atoi(v); i++; }
+        else if (!strcmp(a, "--cpu-lanes")) { cpu_lanes = atoi(v); i++; }
         else if (!strcmp(a, "--diff")) { M.diff_hint = atof(v); i++; }
         else if (!strcmp(a, "--proto")) { M.proto = !strcmp(v, "aria") ? 2 : !strcmp(v, "stratum") ? 1 : 0; i++; }
         else {
@@ -364,7 +486,11 @@ int main(int argc, char **argv)
                    "  --pool bound.ariabrain.com:3373   pool AriaPool (riconosciuto da solo; --proto aria|stratum per forzare, --diff N difficolta' chiesta)\n"
                    "  --pool IP_DEL_PC:7340             in solitaria sul proprio nodo, col ponte bound_bridge.py\n"
                    "  --tune                 all'avvio misura quanti hash in volo rendono di piu' su questa scheda (10 s) e usa quel valore\n"
-                   "  --bench SECONDI        solo la velocita', senza rete\n");
+                   "  --bench SECONDI        solo la velocita', senza rete\n"
+                   "  --cpu N|auto           mina anche con la CPU: N thread (auto = tutti i thread logici meno uno, per la GPU)\n"
+                   "  --cpu-lanes L          hash calcolati insieme da ogni thread CPU, 1..4 (default 3, il migliore misurato su Ryzen 7950X3D)\n"
+                   "  --tune-cpu             all'avvio prova varie combinazioni di thread e hash per thread (circa 40 s) e usa la migliore\n"
+                   "  --no-gpu               solo la CPU (senza scheda NVIDIA)\n");
             if (DEVFEE_PERCENT > 0) printf("\nDev fee: %d %% del tempo (%.0f s ogni %.0f minuti) il miner lavora per l'indirizzo dello sviluppatore\n" DEVFEE_ADDRESS "\n(si presenta al tuo ponte o al pool con quell'indirizzo). Il bench non ha fee.\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
             return 2;
         }
@@ -376,8 +502,46 @@ int main(int argc, char **argv)
     if (bp_selftest()) { say("selftest BoundHash sulla CPU FALLITO\n"); return 1; }
     if (bp_set_lines(lines)) return 1;
     if (!bench && !M.user) { say("manca --user INDIRIZZO_BOUND.nome (oppure --bench 20)\n"); return 2; }
+    mtx_init(&W.lock); W.lines = lines;
+    if (tune_cpu && !cpu_threads) cpu_threads = -1;
+    if (!use_gpu && !cpu_threads) cpu_threads = -1;
+    int nlog = ncpu_logical();
+    if (cpu_threads < 0) cpu_threads = nlog > 1 ? nlog - (use_gpu ? 1 : 0) : 1;
+    if (cpu_threads > CPU_MAXT) cpu_threads = CPU_MAXT;
+    if (cpu_lanes < 1) cpu_lanes = 1;
+    if (cpu_lanes > CPUH_MAXLANES) cpu_lanes = CPUH_MAXLANES;
+    if (cpu_threads) {
+        const char *eng = cpuh_engine();
+        int st = cpuh_selftest(lines);
+        say("CPU: %d thread logici, BoundHash %s, controllo contro il riferimento: %s\n", nlog, eng, st ? "HASH DIVERSI: CPU esclusa" : "OK");
+        if (st) { cpu_threads = 0; if (!use_gpu) return 1; }
+    }
+    if (tune_cpu && cpu_threads) {
+        /* thread: meta' (un thread per core fisico se c'e' l'SMT), tutti meno uno, tutti; hash per thread: 1..4 */
+        int tc[3] = { nlog / 2, nlog - 1, nlog }, bt = 0, bl = 0; double best = 0;
+        static uint8_t th[80];
+        say("taratura CPU: thread x hash per thread -> kH/s\n");
+        mtx_lock(&W.lock); memset(W.target, 0, 32); memcpy(W.header, th, 80); W.next = 0; W.left = 1ull << 40; W.active = 1; mtx_unlock(&W.lock);
+        for (int a = 0; a < 3; a++) {
+            int t = tc[a]; if (t < 1 || (a && t == tc[a - 1])) continue;
+            for (int l = 1; l <= CPUH_MAXLANES; l++) {
+                cpu_start(t, l); sleep_ms(700);
+                unsigned long long h0 = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED); double t0 = now_s();
+                sleep_ms(2500);
+                double r = (__atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED) - h0) / (now_s() - t0);
+                cpu_stop();
+                say("  %3d x %d  %7.1f\n", t, l, r / 1e3);
+                if (r > best * 1.015) { best = r; bt = t; bl = l; }      /* a parita' (entro 1,5 %%) vince la prima: meno thread e memoria */
+            }
+        }
+        work_off(); W.cpu_hashes = 0;                              /* il conteggio della taratura non va nelle medie */
+        if (bt) { cpu_threads = bt; cpu_lanes = bl; }
+        say("taratura CPU: scelgo %d thread x %d hash (%.1f kH/s). Per saltarla la prossima volta: --cpu %d --cpu-lanes %d\n",
+            cpu_threads, cpu_lanes, best / 1e3, cpu_threads, cpu_lanes);
+    }
     batch = (batch / block) * block;
-    gpu_t g;
+    gpu_t g; memset(&g, 0, sizeof g);
+    if (use_gpu) {
     /* senza --batch: 8192 hash in volo (il meglio misurato sulla RTX 4090) o quanti ne stanno in memoria; con --tune fino a 16384 */
     gpu_cap = tune ? 16384 : 8192;
     if (gpu_open(&g, dev_i, cpu, lines, tune ? 0 : batch, kernel_ptx)) return 1;
@@ -416,15 +580,34 @@ int main(int argc, char **argv)
         say("controllo del kernel contro la CPU: %s\n", bad ? "HASH DIVERSI: non mino" : "OK");
         if (bad) return 1;
     }
+    }   /* use_gpu */
+    if (cpu_threads) say("CPU: %d thread x %d hash insieme (%.1f MiB di scratchpad)%s\n", cpu_threads, cpu_lanes,
+                         cpu_threads * cpu_lanes * (double)lines * 128 / 1048576.0, use_gpu ? ", a priorita' bassa: la GPU ha la precedenza" : "");
+    if (!use_gpu) batch = 0;
 
     double t_start = now_s(), t_stat = t_start, t_retry = 0;
     unsigned long long hashes = 0, h_stat = 0;
     if (bench > 0) {
-        uint8_t h[80] = {0}; uint32_t base = 0;
-        while (now_s() - t_start < bench) { make_job(&g, h, base, 0, 0); if (launch(&g, batch)) return 1; base += batch; hashes += batch; }
-        say("bench: %.0f H/s (%.1f kH/s) in %.0f s\n", hashes / (now_s() - t_start), hashes / (now_s() - t_start) / 1e3, now_s() - t_start);
+        uint8_t h[80] = {0}; uint32_t base = 0x80000000u;          /* GPU nella meta' alta dei nonce, CPU in quella bassa */
+        if (cpu_threads) {
+            mtx_lock(&W.lock); memset(W.target, 0, 32); memset(W.header, 0, 80); W.next = 0; W.left = 0x80000000u; W.active = 1; mtx_unlock(&W.lock);
+            cpu_start(cpu_threads, cpu_lanes);
+        }
+        unsigned long long c0 = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED); t_start = now_s();
+        while (now_s() - t_start < bench) {
+            if (use_gpu) { make_job(&g, h, base, 0, 0); if (launch(&g, batch)) return 1; base += batch; hashes += batch; }
+            else sleep_ms(50);
+        }
+        double dt = now_s() - t_start, cr = (__atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED) - c0) / dt;
+        if (cpu_threads) cpu_stop();
+        say("bench: %.0f H/s (%.1f kH/s) in %.0f s", (hashes / dt) + cr, (hashes / dt + cr) / 1e3, dt);
+        if (cpu_threads && use_gpu) say("  =  GPU %.1f kH/s + CPU %.1f kH/s", hashes / dt / 1e3, cr / 1e3);
+        else if (cpu_threads) say("  (CPU)");
+        say("\n");
         return 0;
     }
+    if (cpu_threads) cpu_start(cpu_threads, cpu_lanes);
+    unsigned long long cpu_stat = 0;
     net_init();
     M.suggest = 0;                          /* dopo la prima misura: una share ogni share_s secondi */
     double fee_next = now_s() + DEVFEE_FIRST_S, fee_end = 0;
@@ -448,36 +631,57 @@ int main(int argc, char **argv)
         if (pool_poll()) { tsay("%s: connessione persa, riprovo", LBL); sock_close(M.s); M.s = SOCK_BAD; t_retry = now_s() + 3; continue; }
         if (M.aria) {
             if (now_s() - M.t_keep > 30) { char kb[96]; snprintf(kb, sizeof kb, "{\"id\":%d,\"method\":\"keepalive\",\"params\":{}}\n", ++M.msgid); pool_send(kb); M.t_keep = now_s(); }
-            if (!(M.authorized && M.ajob.valid)) { sleep_ms(20); continue; }
-            if (M.newjob || !M.awork.valid) new_work();
-            if (M.nonces_left < batch) { sleep_ms(50); continue; }        /* intervallo di nonce finito: aspetto il prossimo job */
+            if (!(M.authorized && M.ajob.valid)) { work_off(); sleep_ms(20); continue; }
+            if (M.newjob || !M.awork.valid) { new_work(); work_publish(); }
         } else {
-            if (!(M.subscribed && M.authorized && M.job.valid && M.diff > 0)) { sleep_ms(20); continue; }
-            if (M.newjob || !M.work.valid || M.nonces_left < batch) new_work();
+            if (!(M.subscribed && M.authorized && M.job.valid && M.diff > 0)) { work_off(); sleep_ms(20); continue; }
+            if (M.newjob || !M.work.valid || work_left() < (batch ? batch : 4096)) { new_work(); work_publish(); }
         }
-        make_job(&g, M.header, M.next_nonce, bp_top64(M.share_target), 0);
-        if (launch(&g, batch)) return 1;
-        hashes += batch;
-        for (unsigned k = 0; k < g.found[0] && k < 255; k++) {
-            uint8_t hh[32]; uint32_t nonce = g.found[1 + k];
-            bp_hash_nonce(M.header, nonce, hh);                       /* ogni nonce ricontrollato sulla CPU */
-            if (bp_top64(hh) > bp_top64(M.share_target)) { M.hw++; tsay("ERRORE: la GPU ha dato un nonce sbagliato (%08x)", nonce); continue; }
-            if (!bp_le256_le(hh, M.share_target)) continue;           /* sotto i 64 bit alti ma sopra il target intero */
-            M.found++; submit(nonce, hh);
+        mtx_lock(&W.lock); memcpy(W.target, M.share_target, 32); mtx_unlock(&W.lock);    /* la difficolta' puo' cambiare a meta' job */
+        /* share della CPU: ricontrollate e mandate se l'header e' ancora quello */
+        {
+            struct { uint32_t gen, nonce; uint8_t hash[32]; } q[64]; int nq;
+            mtx_lock(&W.lock); nq = W.nq; memcpy(q, W.q, sizeof q[0] * (size_t)nq); W.nq = 0; uint32_t cur = W.gen; mtx_unlock(&W.lock);
+            for (int k = 0; k < nq; k++) {
+                if (q[k].gen != cur) continue;                                       /* header cambiato: share vecchia */
+                uint8_t hh[32]; bp_hash_nonce(M.header, q[k].nonce, hh);
+                if (memcmp(hh, q[k].hash, 32)) { M.hw++; tsay("ERRORE: la CPU ha dato un hash sbagliato (%08x)", q[k].nonce); continue; }
+                if (!bp_le256_le(hh, M.share_target)) continue;
+                M.found++; submit(q[k].nonce, hh);
+            }
         }
-        M.next_nonce += batch; M.nonces_left -= batch;
+        if (use_gpu) {
+            uint32_t start, gen;
+            if (work_take(batch, &start, &gen, NULL, NULL)) { sleep_ms(M.aria ? 50 : 5); continue; }   /* nonce del job finiti: aspetto il prossimo */
+            make_job(&g, M.header, start, bp_top64(M.share_target), 0);
+            if (launch(&g, batch)) return 1;
+            hashes += batch;
+            for (unsigned k = 0; k < g.found[0] && k < 255; k++) {
+                uint8_t hh[32]; uint32_t nonce = g.found[1 + k];
+                bp_hash_nonce(M.header, nonce, hh);                       /* ogni nonce ricontrollato sulla CPU */
+                if (bp_top64(hh) > bp_top64(M.share_target)) { M.hw++; tsay("ERRORE: la GPU ha dato un nonce sbagliato (%08x)", nonce); continue; }
+                if (!bp_le256_le(hh, M.share_target)) continue;           /* sotto i 64 bit alti ma sopra il target intero */
+                if (gen != __atomic_load_n(&W.gen, __ATOMIC_RELAXED)) continue;
+                M.found++; submit(nonce, hh);
+            }
+        } else sleep_ms(20);
         double t = now_s();
+        unsigned long long all = hashes + __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED);
         if (!M.aria && M.suggest == 0 && t - t_start > 3) {                      /* difficolta' sulla velocita' vera */
             char b[128];
-            M.suggest = (hashes / (t - t_start)) * share_s / 4294967296.0;
+            M.suggest = (all / (t - t_start)) * share_s / 4294967296.0;
             snprintf(b, sizeof b, "{\"id\":%d,\"method\":\"mining.suggest_difficulty\",\"params\":[%.6g]}\n", ++M.msgid, M.suggest);
             pool_send(b);
         }
         if (t - t_stat >= 10) {
-            tsay("%.1f kH/s (media %.1f) | share %llu accettate (dev fee %llu), %llu rifiutate, %llu vecchie | errori GPU %llu%s",
-                 (hashes - h_stat) / (t - t_stat) / 1e3, hashes / (t - t_start) / 1e3, M.accepted, M.fee_accepted, M.rejected, M.stale, M.hw,
-                 M.fee ? " | dev fee in corso" : "");
-            t_stat = t; h_stat = hashes;
+            unsigned long long ch = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED);
+            char parts[96] = "";
+            if (cpu_threads && use_gpu) snprintf(parts, sizeof parts, " = GPU %.1f + CPU %.1f", (hashes - h_stat) / (t - t_stat) / 1e3, (ch - cpu_stat) / (t - t_stat) / 1e3);
+            else if (cpu_threads) snprintf(parts, sizeof parts, " (CPU)");
+            tsay("%.1f kH/s%s (media %.1f) | share %llu accettate (dev fee %llu), %llu rifiutate, %llu vecchie | errori %llu%s",
+                 (hashes - h_stat + ch - cpu_stat) / (t - t_stat) / 1e3, parts, all / (t - t_start) / 1e3, M.accepted, M.fee_accepted,
+                 M.rejected, M.stale, M.hw, M.fee ? " | dev fee in corso" : "");
+            t_stat = t; h_stat = hashes; cpu_stat = ch;
         }
     }
 }
