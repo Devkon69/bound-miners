@@ -31,7 +31,7 @@ $Z cc  $W -std=gnu99 -O2 -w -c src/third_party/cJSON.c -o /tmp/w_cj.o
 $Z c++ $W -O2 -s -static -o dist/bound-gpubench.exe /tmp/w_gb.o /tmp/w_bk.o /tmp/w_bp.o
 $Z c++ $W -O2 -s -static -o dist/bound-gpuminer.exe /tmp/w_gm.o /tmp/w_ch.o /tmp/w_cj.o /tmp/w_bk.o /tmp/w_bp.o -lws2_32
 ls -la dist
-# file .bat del pacchetto Windows: scripts/
+# file .bat del pacchetto Windows: scripts/   script .sh del pacchetto Linux: scripts_linux/
 # prova del protocollo AriaPool senza GPU:  MINER=dist/bound-gpuminer python3 tools/e2e_pool.py [S] [--cpu 2 | --no-gpu --cpu 2]
 # prova completa senza GPU (serve boundd con la patch):
 #   BOUNDD=.../boundd BOUNDCLI=.../bound-cli python3 tools/e2e.py

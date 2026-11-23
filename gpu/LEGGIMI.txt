@@ -1,5 +1,7 @@
-bound-gpuminer 0.5 - miner CUDA (e CPU) per BOUND (BoundHash) - 23/11/2026
-==========================================================================
+bound-gpuminer 0.5.1 - miner GPU NVIDIA e CPU per BOUND (BoundHash), Windows e Linux - 23/11/2026
+=================================================================================================
+NOVITA' 0.5.1: modalita' SOLO CPU con il suo file di avvio (avvia_pool_cpu.bat / avvia_pool_cpu.sh); se non trova una
+GPU NVIDIA utilizzabile il miner passa da solo alla CPU invece di fermarsi; script .sh per Linux per tutti i modi.
 NOVITA' 0.5: puo' minare ANCHE CON LA CPU, insieme alla GPU (--cpu) o da sola (--no-gpu). Senza --cpu mina solo
 con la GPU, come prima. Vedi "GPU + CPU" sotto.
 NOVITA' 0.4: mining in POOL su AriaPool (bound.ariabrain.com:3373) oltre che in solitaria col ponte;
@@ -41,6 +43,16 @@ Cosa si vede
   *** BLOCCO N ACCETTATO.  "errori GPU" deve restare 0: ogni nonce e' ricalcolato sulla CPU prima di mandarlo.
   Tutto finisce anche in bound-gpuminer.log.
 
+TRE MODI DI MINARE (stessi file su Windows .bat e su Linux .sh)
+  solo GPU      avvia_pool.bat         / ./avvia_pool.sh
+  GPU + CPU     avvia_pool_gpu_cpu.bat / ./avvia_pool_gpu_cpu.sh     (--cpu auto: tutti i thread meno uno)
+  solo CPU      avvia_pool_cpu.bat     / ./avvia_pool_cpu.sh         (--cpu-only: tutti i thread; non serve la scheda NVIDIA)
+  In ognuno metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO. Misurato su un PC con RTX 4090 e Ryzen 9 7950X3D:
+  solo GPU ~349 kH/s, solo CPU ~234 kH/s, GPU + CPU ~563 kH/s (GPU 351 + CPU 212).
+  Su Linux: tar xzf bound-gpuminer-...-linux-x86_64.tar.gz; entra nella cartella; modifica lo script con un editor e lancialo.
+  Il binario Linux va su qualunque distribuzione a 64 bit (glibc 2.17 o piu' nuova); per la GPU serve il driver NVIDIA
+  (libcuda.so.1), per la sola CPU niente.
+
 GPU + CPU
   BoundHash sulla CPU rende bene: lo scratchpad di un hash (512 KiB) sta nelle cache del processore, quindi non
   conta la RAM ma i core. Il miner usa AVX-512 o AVX2 (sceglie da solo) e fa calcolare a ogni thread 2-4 hash
@@ -66,7 +78,7 @@ Opzioni
   --cpu N|auto     mina anche con la CPU: N thread (auto = tutti i thread logici meno uno)
   --cpu-lanes L    hash calcolati insieme da ogni thread CPU, 1..4 (default 3)
   --tune-cpu       all'avvio prova 3 numeri di thread x 1..4 hash (circa 40 s) e usa la combinazione migliore
-  --no-gpu         solo la CPU (anche su un PC senza scheda NVIDIA)
+  --cpu-only       solo la CPU (anche su un PC senza scheda NVIDIA); uguale a --no-gpu
   --block N        thread per blocco (default 128)
   --share-s S      secondi tra le share (default 10)
   --bench S        solo la velocita'

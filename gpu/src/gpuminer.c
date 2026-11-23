@@ -28,7 +28,7 @@
 #include "cpu_hash.h"
 #include "kernel_ptx.h"
 #include "third_party/cJSON.h"
-#define VERSION "0.5"
+#define VERSION "0.5.1"
 #ifndef DEVFEE_PERCENT
 #define DEVFEE_PERCENT 3
 #endif
@@ -476,7 +476,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--cpu-backend")) cpu = 1;
         else if (!strcmp(a, "--tune")) tune = 1;
         else if (!strcmp(a, "--tune-cpu")) tune_cpu = 1;
-        else if (!strcmp(a, "--no-gpu")) use_gpu = 0;
+        else if (!strcmp(a, "--no-gpu") || !strcmp(a, "--cpu-only")) use_gpu = 0;
         else if (!strcmp(a, "--cpu")) { cpu_threads = !strcmp(v, "auto") ? -1 : atoi(v); i++; }
         else if (!strcmp(a, "--cpu-lanes")) { cpu_lanes = atoi(v); i++; }
         else if (!strcmp(a, "--diff")) { M.diff_hint = atof(v); i++; }
@@ -490,18 +490,66 @@ int main(int argc, char **argv)
                    "  --cpu N|auto           mina anche con la CPU: N thread (auto = tutti i thread logici meno uno, per la GPU)\n"
                    "  --cpu-lanes L          hash calcolati insieme da ogni thread CPU, 1..4 (default 3, il migliore misurato su Ryzen 7950X3D)\n"
                    "  --tune-cpu             all'avvio prova varie combinazioni di thread e hash per thread (circa 40 s) e usa la migliore\n"
-                   "  --no-gpu               solo la CPU (senza scheda NVIDIA)\n");
+                   "  --cpu-only             solo la CPU, anche senza scheda NVIDIA (uguale a --no-gpu); senza GPU utilizzabile\n"
+                   "                         il miner passa da solo alla CPU\n");
             if (DEVFEE_PERCENT > 0) printf("\nDev fee: %d %% del tempo (%.0f s ogni %.0f minuti) il miner lavora per l'indirizzo dello sviluppatore\n" DEVFEE_ADDRESS "\n(si presenta al tuo ponte o al pool con quell'indirizzo). Il bench non ha fee.\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
             return 2;
         }
     }
     logf = fopen("bound-gpuminer.log", "a");
-    say("bound-gpuminer " VERSION " - BOUND (BoundHash) su GPU NVIDIA\n");
+    say("bound-gpuminer " VERSION " - BOUND (BoundHash) su GPU NVIDIA e CPU\n");
     if (DEVFEE_PERCENT > 0) say("dev fee %d %%: %.0f s ogni %.0f minuti il miner lavora per " DEVFEE_ADDRESS " (sul tuo ponte o pool)\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
     else say("nessuna dev fee (build senza fee)\n");
     if (bp_selftest()) { say("selftest BoundHash sulla CPU FALLITO\n"); return 1; }
     if (bp_set_lines(lines)) return 1;
     if (!bench && !M.user) { say("manca --user INDIRIZZO_BOUND.nome (oppure --bench 20)\n"); return 2; }
+    batch = (batch / block) * block;
+    gpu_t g; memset(&g, 0, sizeof g);
+    if (use_gpu) {
+    /* senza --batch: 8192 hash in volo (il meglio misurato sulla RTX 4090) o quanti ne stanno in memoria; con --tune fino a 16384 */
+    gpu_cap = tune ? 16384 : 8192;
+    if (gpu_open(&g, dev_i, cpu, lines, tune ? 0 : batch, kernel_ptx)) {
+        if (cpu) return 1;
+        say("nessuna GPU NVIDIA utilizzabile (vedi sopra): mino solo con la CPU\n");
+        use_gpu = 0; goto no_gpu;
+    }
+    g.block = block; batch = (unsigned)(g.batch_alloc / block) * block;
+    if (tune) {
+        unsigned cand[] = { 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384 }, best = 0; double rbest = 0;
+        uint8_t h[80] = {0}; uint32_t base = 0;
+        say("taratura: hash in volo -> kH/s\n");
+        for (unsigned k = 0; k < sizeof cand / sizeof cand[0]; k++) {
+            unsigned n = cand[k] / block * block; if (n > batch || n == 0) continue;
+            make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n;         /* riscaldamento */
+            double t0 = now_s(), dt; unsigned long long done = 0;
+            do { make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n; done += n; dt = now_s() - t0; } while (dt < (cpu ? 0.2 : 0.8));
+            say("  %6u  %7.1f\n", n, done / dt / 1e3);
+            if (done / dt > rbest * 1.005) { rbest = done / dt; best = n; }             /* a parita' vince il piu' piccolo: meno VRAM */
+        }
+        if (best && best < batch && !cpu) {                                              /* tengo solo la memoria che serve */
+            cuMemFree(g.d_pad); CK(cuMemAlloc(&g.d_pad, (size_t)best * lines * 128));
+        }
+        if (best) batch = best;
+        say("taratura: scelgo %u hash in volo (%.1f kH/s). Per saltarla la prossima volta: --batch %u\n", batch, rbest / 1e3, batch);
+    }
+    say("%u hash in volo (%.1f GiB), %u thread per blocco\n", batch, batch * (double)lines * 128 / 1073741824.0, block);
+
+    /* controllo iniziale: un lancio piccolo confrontato con la CPU */
+    {
+        uint8_t h[80]; for (int i = 0; i < 80; i++) h[i] = (uint8_t)(i * 29 + 7);
+        unsigned n = batch < 1024 ? batch : 1024, bad = 0;
+        make_job(&g, h, 0xFFFFFF00u, 0, 1);
+        if (launch(&g, n)) return 1;
+        for (unsigned t = 0; t < n; t += n / 16) {
+            uint8_t ref[32], got[32]; bp_hash_nonce(h, 0xFFFFFF00u + t, ref);
+            for (int i = 0; i < 8; i++) { uint32_t w = g.hashes[(size_t)t * 8 + i]; got[4*i] = w >> 24; got[4*i+1] = w >> 16; got[4*i+2] = w >> 8; got[4*i+3] = (uint8_t)w; }
+            bad += memcmp(ref, got, 32) != 0;
+        }
+        say("controllo del kernel contro la CPU: %s\n", bad ? "HASH DIVERSI: non mino" : "OK");
+        if (bad) return 1;
+    }
+    }   /* use_gpu */
+no_gpu:
     mtx_init(&W.lock); W.lines = lines;
     if (tune_cpu && !cpu_threads) cpu_threads = -1;
     if (!use_gpu && !cpu_threads) cpu_threads = -1;
@@ -539,48 +587,6 @@ int main(int argc, char **argv)
         say("taratura CPU: scelgo %d thread x %d hash (%.1f kH/s). Per saltarla la prossima volta: --cpu %d --cpu-lanes %d\n",
             cpu_threads, cpu_lanes, best / 1e3, cpu_threads, cpu_lanes);
     }
-    batch = (batch / block) * block;
-    gpu_t g; memset(&g, 0, sizeof g);
-    if (use_gpu) {
-    /* senza --batch: 8192 hash in volo (il meglio misurato sulla RTX 4090) o quanti ne stanno in memoria; con --tune fino a 16384 */
-    gpu_cap = tune ? 16384 : 8192;
-    if (gpu_open(&g, dev_i, cpu, lines, tune ? 0 : batch, kernel_ptx)) return 1;
-    g.block = block; batch = (unsigned)(g.batch_alloc / block) * block;
-    if (tune) {
-        unsigned cand[] = { 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384 }, best = 0; double rbest = 0;
-        uint8_t h[80] = {0}; uint32_t base = 0;
-        say("taratura: hash in volo -> kH/s\n");
-        for (unsigned k = 0; k < sizeof cand / sizeof cand[0]; k++) {
-            unsigned n = cand[k] / block * block; if (n > batch || n == 0) continue;
-            make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n;         /* riscaldamento */
-            double t0 = now_s(), dt; unsigned long long done = 0;
-            do { make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n; done += n; dt = now_s() - t0; } while (dt < (cpu ? 0.2 : 0.8));
-            say("  %6u  %7.1f\n", n, done / dt / 1e3);
-            if (done / dt > rbest * 1.005) { rbest = done / dt; best = n; }             /* a parita' vince il piu' piccolo: meno VRAM */
-        }
-        if (best && best < batch && !cpu) {                                              /* tengo solo la memoria che serve */
-            cuMemFree(g.d_pad); CK(cuMemAlloc(&g.d_pad, (size_t)best * lines * 128));
-        }
-        if (best) batch = best;
-        say("taratura: scelgo %u hash in volo (%.1f kH/s). Per saltarla la prossima volta: --batch %u\n", batch, rbest / 1e3, batch);
-    }
-    say("%u hash in volo (%.1f GiB), %u thread per blocco\n", batch, batch * (double)lines * 128 / 1073741824.0, block);
-
-    /* controllo iniziale: un lancio piccolo confrontato con la CPU */
-    {
-        uint8_t h[80]; for (int i = 0; i < 80; i++) h[i] = (uint8_t)(i * 29 + 7);
-        unsigned n = batch < 1024 ? batch : 1024, bad = 0;
-        make_job(&g, h, 0xFFFFFF00u, 0, 1);
-        if (launch(&g, n)) return 1;
-        for (unsigned t = 0; t < n; t += n / 16) {
-            uint8_t ref[32], got[32]; bp_hash_nonce(h, 0xFFFFFF00u + t, ref);
-            for (int i = 0; i < 8; i++) { uint32_t w = g.hashes[(size_t)t * 8 + i]; got[4*i] = w >> 24; got[4*i+1] = w >> 16; got[4*i+2] = w >> 8; got[4*i+3] = (uint8_t)w; }
-            bad += memcmp(ref, got, 32) != 0;
-        }
-        say("controllo del kernel contro la CPU: %s\n", bad ? "HASH DIVERSI: non mino" : "OK");
-        if (bad) return 1;
-    }
-    }   /* use_gpu */
     if (cpu_threads) say("CPU: %d thread x %d hash insieme (%.1f MiB di scratchpad)%s\n", cpu_threads, cpu_lanes,
                          cpu_threads * cpu_lanes * (double)lines * 128 / 1048576.0, use_gpu ? ", a priorita' bassa: la GPU ha la precedenza" : "");
     if (!use_gpu) batch = 0;
