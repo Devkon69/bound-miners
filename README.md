@@ -55,8 +55,9 @@ in the processor) with OpenCL, loaded at run time from the card's driver. By def
 each in its own thread, together with the CPU (`--cpu auto`); all of them take nonces from one shared counter. `--list-gpus`
 lists them, `--gpu 0,2` picks some, `--no-cuda` runs NVIDIA cards through OpenCL. The OpenCL kernel is the same source as
 the CUDA one (`src/bound_kernel.cu`, `__OPENCL_VERSION__` branch), compiled by the driver at start-up and checked against
-the CPU; it gives the reference hashes on an OpenCL CPU implementation (POCL) but **has not run on a real AMD or Intel GPU
-yet**.
+the CPU. Tested on the pool with three parts at once on one PC: RTX 3060 (CUDA) + Radeon RX 6600 (OpenCL) + 12-thread
+CPU (AVX2), about 152 kH/s (62 + 37 + 52), shares accepted. Intel GPUs are not tested yet. On cards other than the RTX 4090,
+run `--tune` once to find the best number of hashes in flight for each card.
 
 **GPU + CPU (from 0.5).** `--cpu auto` adds CPU threads next to the GPU (all logical CPUs but one), `--cpu-only` mines with
 the CPU alone, also on a PC without an NVIDIA card (without a usable GPU the miner falls back to the CPU by itself). Launch
@@ -95,6 +96,7 @@ The benchmarks have no fee. The source is here: build with `-DDEVFEE_PERCENT=0` 
 | RTX 4090 | 348 kH/s | measured, 8192 hashes in flight (4 GiB of VRAM), default settings |
 | BlackMiner F1 Ultra, one hash board (6 x XC7K420T) | 42-50 kH/s, ~50 W | timing closed at 90 MHz (41.7 kH/s nominal); runs up to 100 MHz in overclock (46.3 kH/s nominal); about 50 kH/s and 50 W reported on a real board |
 | CPU, Ryzen 9 7950X3D (31 threads, 3 hashes per thread) | 234 kH/s alone, 212 kH/s next to the GPU | AVX-512; `--tune-cpu` picks the threads and hashes per thread |
+| RTX 3060 + Radeon RX 6600 + 12-thread CPU together | about 152 kH/s on AriaPool | GPU0 62 (CUDA) + GPU1 37 (OpenCL) + CPU 52; default batch, not tuned |
 | RTX 4090 + Ryzen 9 7950X3D together | about 563 kH/s on AriaPool | GPU 351 + CPU 212; 274 shares accepted, 0 rejected |
 | BlackMiner F2, one hash board (6 x XC7VX415T) | 41.7 kH/s nominal | 7 cores per FPGA, timing closed at 90 MHz (WNS +0.043 ns); runs on a real machine |
 | BlackMiner F1 / F1 Plus (XC7K325T) | 2.98 kH/s per FPGA nominal | 3 cores per FPGA (block RAM limit), timing closed at 90 MHz (WNS +0.363 ns); runs on a real machine |

@@ -58,8 +58,10 @@ PIU' GPU, AMD E INTEL (0.6)
   Le integrate usano la RAM del sistema (al piu' 1 GiB) e dividono consumo e calore con la CPU: possono togliere alla CPU
   piu' di quanto rendono. Confronta con bench.bat (tutto) e bench.bat --gpu 0 (solo la prima scheda); se conviene
   lasciarla fuori, scrivi --gpu e i numeri delle schede da usare negli script di avvio.
-  Stato: il kernel OpenCL da' gli stessi hash del riferimento (provato con un'implementazione OpenCL su CPU); NON E' ANCORA
-  STATO PROVATO SU UNA SCHEDA AMD O INTEL VERA. Per provarlo su una NVIDIA: bench.bat --no-cuda.
+  Provato sul pool (24/11/2026) con tre parti insieme su un PC: NVIDIA RTX 3060 (CUDA) + AMD Radeon RX 6600 (OpenCL) + CPU
+  a 12 thread (AVX2): circa 152 kH/s = GPU0 62 + GPU1 37 + CPU 52, share accettate. Le GPU Intel non sono ancora provate.
+  Su schede diverse dalla 4090 conviene lanciare una volta taratura.bat (--tune): prova quanti hash in volo rendono di piu'
+  su ogni scheda e scrive il valore migliore.
 
 TRE MODI DI MINARE (stessi file su Windows .bat e su Linux .sh)
   solo GPU      avvia_pool.bat         / ./avvia_pool.sh
