@@ -1,5 +1,6 @@
 /* gpu_common.h - parte comune di bound-gpubench e bound-gpuminer: orologio, log, driver CUDA caricato a runtime
- * (nvcuda.dll / libcuda.so.1), preparazione del lavoro e lancio del kernel. */
+ * (nvcuda.dll / libcuda.so.1), preparazione del lavoro e lancio del kernel. Ogni gpu_t ha il suo contesto: piu' schede,
+ * ognuna nel suo thread. Il backend OpenCL (AMD, Intel) e' in gpu_ocl.h. */
 #ifndef GPU_COMMON_H
 #define GPU_COMMON_H
 #ifdef _WIN32
@@ -39,10 +40,14 @@ static int (*cuInit)(unsigned), (*cuDriverGetVersion)(int *), (*cuDeviceGetCount
     (*cuMemcpyHtoD)(dptr, const void *, size_t), (*cuMemcpyDtoH)(void *, dptr, size_t),
     (*cuLaunchKernel)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **);
 
+static int cuda_quiet;          /* 1: niente messaggio se manca il driver (si cercano anche le schede OpenCL) */
 static int cuda_load(void)
 {
+    static int done = 0;
+    if (done) return done > 0 ? 0 : -1;
+    done = -1;
     void *l = lib_open();
-    if (!l) { say("driver CUDA non trovato (" CUDALIB "): serve una scheda NVIDIA con il driver installato\n"); return -1; }
+    if (!l) { if (!cuda_quiet) say("driver CUDA non trovato (" CUDALIB "): serve una scheda NVIDIA con il driver installato\n"); return -1; }
 #define S(v, n) do { *(void **)&v = lib_sym(l, n); if (!v) { say("nel driver manca %s\n", n); return -1; } } while (0)
     S(cuInit, "cuInit"); S(cuDriverGetVersion, "cuDriverGetVersion"); S(cuDeviceGetCount, "cuDeviceGetCount"); S(cuDeviceGet, "cuDeviceGet");
     S(cuDeviceGetName, "cuDeviceGetName"); S(cuDeviceTotalMem, "cuDeviceTotalMem_v2"); S(cuDeviceGetAttribute, "cuDeviceGetAttribute");
@@ -51,12 +56,17 @@ static int cuda_load(void)
     S(cuMemAlloc, "cuMemAlloc_v2"); S(cuMemFree, "cuMemFree_v2"); S(cuMemGetInfo, "cuMemGetInfo_v2");
     S(cuMemcpyHtoD, "cuMemcpyHtoD_v2"); S(cuMemcpyDtoH, "cuMemcpyDtoH_v2"); S(cuLaunchKernel, "cuLaunchKernel");
 #undef S
+    done = 1;
     return 0;
 }
 #define CK(call) do { int e_ = (call); if (e_) { say("errore CUDA %d in %s\n", e_, #call); return -1; } } while (0)
 
 /* ------------------------------------------------------------------ un lancio: batch hash con nonce base.. */
 typedef struct {
+    int kind;                   /* 0 CUDA, 1 OpenCL, 2 kernel sulla CPU (solo prove) */
+    char name[160];
+    void *cu_ctx;               /* CUDA */
+    void *cl_ctx, *cl_q, *cl_k, *cl_pad, *cl_job, *cl_found, *cl_hash;   /* OpenCL */
     int cpu;                    /* backend CPU (prova) */
     unsigned lines, block;
     size_t batch_alloc;
@@ -77,9 +87,11 @@ static void make_job(gpu_t *g, const uint8_t header[80], uint32_t base, uint64_t
     bp_tag_mid("BOUND/BoundHash-result", g->job + 16);
 }
 
+static int launch_ocl(gpu_t *g, unsigned batch);
 static int launch(gpu_t *g, unsigned batch)
 {
     memset(g->found, 0, sizeof g->found);
+    if (g->kind == 1) return launch_ocl(g, batch);
     if (g->cpu) {
         bound_cpu_launch(g->h_pad, g->job, g->found, g->hashes, batch);
         return 0;
@@ -96,12 +108,12 @@ static int launch(gpu_t *g, unsigned batch)
 
 /* apre la scheda dev_i (o il backend CPU), carica il kernel e alloca gli scratchpad per `want` hash in volo
  * (0 = quanti ne stanno nella memoria libera meno 1 GiB, al piu' 40960). Ritorna 0 se va bene. */
-static void *gpu_ctx;
 static size_t gpu_cap = 40960;   /* tetto degli hash in volo quando want = 0 */
 __attribute__((unused)) static int gpu_open(gpu_t *g, int dev_i, int cpu, unsigned lines, unsigned want, const void *ptx)
 {
     memset(g, 0, sizeof *g);
-    g->cpu = cpu; g->lines = lines; g->block = 128;
+    g->cpu = cpu; g->kind = cpu ? 2 : 0; g->lines = lines; g->block = 128;
+    snprintf(g->name, sizeof g->name, cpu ? "kernel sulla CPU" : "GPU %d", dev_i);
     size_t per = (size_t)lines * 128, freeb = 0, totalb = 0;
     if (!cpu) {
         if (cuda_load()) return -1;
@@ -112,7 +124,8 @@ __attribute__((unused)) static int gpu_open(gpu_t *g, int dev_i, int cpu, unsign
         CK(cuDeviceGet(&dev, dev_i));
         cuDeviceGetAttribute(&maj, 75, dev); cuDeviceGetAttribute(&min, 76, dev); cuDeviceGetAttribute(&sms, 16, dev);
         cuDeviceGetName(name, sizeof name, dev);
-        CK(cuCtxCreate(&gpu_ctx, 4 /* blocking sync */, dev));
+        snprintf(g->name, sizeof g->name, "%s", name);
+        CK(cuCtxCreate(&g->cu_ctx, 4 /* blocking sync */, dev));      /* resta legato al thread che apre la scheda */
         CK(cuMemGetInfo(&freeb, &totalb));
         say("GPU %d: %s, compute %d.%d, %d SM, memoria libera %.0f di %.0f MiB, driver CUDA %d.%d\n", dev_i, name, maj, min, sms,
             freeb / 1048576.0, totalb / 1048576.0, ver / 1000, (ver % 1000) / 10);
@@ -139,4 +152,15 @@ __attribute__((unused)) static int gpu_open(gpu_t *g, int dev_i, int cpu, unsign
     }
     return 0;
 }
+/* tiene solo la memoria per n hash in volo (dopo la taratura) */
+static int ocl_alloc_pad(gpu_t *g, size_t n);
+__attribute__((unused)) static int gpu_shrink(gpu_t *g, size_t n)
+{
+    if (n >= g->batch_alloc) return 0;
+    if (g->kind == 1) { if (ocl_alloc_pad(g, n)) return -1; }
+    else if (g->kind == 0) { cuMemFree(g->d_pad); CK(cuMemAlloc(&g->d_pad, n * g->lines * 128)); }
+    g->batch_alloc = n;
+    return 0;
+}
+#include "gpu_ocl.h"
 #endif

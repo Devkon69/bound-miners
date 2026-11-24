@@ -1,5 +1,5 @@
 #!/bin/sh
-# GPU NVIDIA + CPU insieme. --cpu auto = tutti i thread logici meno uno (resta alla GPU).
+# tutte le GPU (NVIDIA, AMD, Intel) + CPU insieme. --cpu auto = tutti i thread logici meno uno per ogni GPU.
 cd "$(dirname "$0")"
 UTENTE=TUO_INDIRIZZO.pc1
 POOL=bound.ariabrain.com:3373

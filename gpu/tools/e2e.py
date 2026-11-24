@@ -28,7 +28,8 @@ blog, mlog = [], []
 bridge = run([sys.executable, BRIDGE, "--address", ADDR, "--datadir", dd, "--rpc", "127.0.0.1:%d" % RPC,
               "--listen", "127.0.0.1:%d" % STR, "--refresh", "5"], blog)
 time.sleep(1)
-miner = run([MINER, "--cpu-backend", "--lines", "64", "--batch", "512", "--pool", "127.0.0.1:%d" % STR, "--user", ADDR + ".gpu", "--share-s", "2"], mlog, cwd=wd)
+miner = run([MINER] + ([] if os.environ.get("E2E_REAL_GPU") else ["--cpu-backend"]) + ["--lines", "64", "--batch", "512", "--pool", "127.0.0.1:%d" % STR,
+             "--user", ADDR + ".gpu", "--share-s", "2"] + sys.argv[2:], mlog, cwd=wd)
 time.sleep(DUR)
 # il ponte cade e torna: il miner deve ricollegarsi da solo
 bridge.terminate(); time.sleep(4)

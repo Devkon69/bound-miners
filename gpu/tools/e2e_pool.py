@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prova di bound-gpuminer contro il pool finto (tools/mock_ariapool.py), senza GPU: kernel sulla CPU, 64 righe.
-   MINER=.../bound-gpuminer [FEE_ADDR=B... se il miner e' compilato con finestre di fee corte] python3 tools/e2e_pool.py [secondi]"""
+   MINER=.../bound-gpuminer [FEE_ADDR=B... se il miner e' compilato con finestre di fee corte] python3 tools/e2e_pool.py [secondi] [opzioni]
+   E2E_REAL_GPU=1: senza --cpu-backend, cioe' con le schede vere (o POCL: BOUND_OPENCL_CPU=1, BOUND_OPENCL_DUP=2 per due schede)"""
 import os, random, subprocess, sys, tempfile, threading, time
 here = os.path.dirname(os.path.abspath(__file__)); root = os.path.dirname(here)
 DUR = float(sys.argv[1]) if len(sys.argv) > 1 else 25
@@ -11,7 +12,7 @@ def run(cmd, sink, **kw):
     threading.Thread(target=lambda: [sink.append(l.rstrip()) for l in p.stdout], daemon=True).start(); return p
 plog, mlog = [], []
 pool = run([sys.executable, os.path.join(here, "mock_ariapool.py"), str(PORT), "64", "3000"], plog, stdin=subprocess.PIPE); time.sleep(0.8)
-miner = run([MINER, "--cpu-backend", "--lines", "64", "--batch", "512", "--pool", "stratum+tcp://127.0.0.1:%d" % PORT, "--user", ADDR + ".rig7"] + sys.argv[2:], mlog, cwd=tempfile.mkdtemp())
+miner = run([MINER] + ([] if os.environ.get("E2E_REAL_GPU") else ["--cpu-backend"]) + ["--lines", "64", "--batch", "512", "--pool", "stratum+tcp://127.0.0.1:%d" % PORT, "--user", ADDR + ".rig7"] + sys.argv[2:], mlog, cwd=tempfile.mkdtemp())
 time.sleep(DUR); pool.stdin.write("DROP\n"); pool.stdin.flush(); time.sleep(40 if "--slow" in os.environ.get("E2E", "") else 12)
 miner.terminate(); time.sleep(0.3); pool.terminate()
 ml = "\n".join(mlog); fails = []

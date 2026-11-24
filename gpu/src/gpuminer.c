@@ -28,7 +28,7 @@
 #include "cpu_hash.h"
 #include "kernel_ptx.h"
 #include "third_party/cJSON.h"
-#define VERSION "0.5.1"
+#define VERSION "0.6"
 #ifndef DEVFEE_PERCENT
 #define DEVFEE_PERCENT 3
 #endif
@@ -152,7 +152,7 @@ static struct {
     uint32_t gen; int active;
     uint8_t header[80], target[32];
     uint32_t next; uint64_t left;
-    struct { uint32_t gen, nonce; uint8_t hash[32]; } q[64]; int nq;
+    struct qent { uint32_t gen, nonce; int src, has_hash; uint64_t t64; uint8_t hash[32]; } q[256]; int nq;
     unsigned lines; int lanes, stop;
     unsigned long long cpu_hashes;
 } W;
@@ -179,7 +179,7 @@ static int work_take(uint32_t n, uint32_t *start, uint32_t *gen, uint8_t hdr[80]
 }
 static uint64_t work_left(void) { mtx_lock(&W.lock); uint64_t l = W.active ? W.left : 0; mtx_unlock(&W.lock); return l; }
 
-typedef struct { int id; thr_t t; } cpuw_t;
+typedef struct { int id; thr_t t; void (*fn)(void *); void *arg; } cpuw_t;
 static void cpu_worker(int id)
 {
     cpuh_t h; uint8_t hdr[80], tgt[32], out[CPUH_MAXLANES][32];
@@ -198,7 +198,7 @@ static void cpu_worker(int id)
             __atomic_fetch_add(&W.cpu_hashes, (unsigned long long)h.lanes, __ATOMIC_RELAXED);
             for (int n = 0; n < h.lanes; n++) if (bp_le256_le(out[n], tgt)) {
                 mtx_lock(&W.lock);
-                if (W.nq < 64) { W.q[W.nq].gen = gen; W.q[W.nq].nonce = nn[n]; memcpy(W.q[W.nq].hash, out[n], 32); W.nq++; }
+                if (W.nq < 256) { struct qent *e = &W.q[W.nq++]; e->gen = gen; e->nonce = nn[n]; e->src = -1; e->has_hash = 1; memcpy(e->hash, out[n], 32); }
                 mtx_unlock(&W.lock);
             }
             if (__atomic_load_n(&W.gen, __ATOMIC_RELAXED) != gen || __atomic_load_n(&W.stop, __ATOMIC_RELAXED)) break;
@@ -206,17 +206,18 @@ static void cpu_worker(int id)
     }
     cpuh_free(&h);
 }
+static void thr_run(cpuw_t *w) { if (w->fn) w->fn(w->arg); else cpu_worker(w->id); }
 #ifdef _WIN32
-static DWORD WINAPI thr_tramp(LPVOID p) { cpu_worker(((cpuw_t *)p)->id); return 0; }
+static DWORD WINAPI thr_tramp(LPVOID p) { thr_run((cpuw_t *)p); return 0; }
 #else
-static void *thr_tramp(void *p) { cpu_worker(((cpuw_t *)p)->id); return NULL; }
+static void *thr_tramp(void *p) { thr_run((cpuw_t *)p); return NULL; }
 #endif
 static cpuw_t cpuw[CPU_MAXT];
 static int cpu_n;
 static int cpu_start(int n, int lanes)
 {
     W.stop = 0; W.lanes = lanes; cpu_n = 0;
-    for (int i = 0; i < n && i < CPU_MAXT; i++) { cpuw[i].id = i; if (thr_start(&cpuw[i].t, &cpuw[i])) break; cpu_n++; }
+    for (int i = 0; i < n && i < CPU_MAXT; i++) { cpuw[i].id = i; cpuw[i].fn = NULL; if (thr_start(&cpuw[i].t, &cpuw[i])) break; cpu_n++; }
     return cpu_n;
 }
 static void cpu_stop(void)
@@ -224,6 +225,131 @@ static void cpu_stop(void)
     __atomic_store_n(&W.stop, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < cpu_n; i++) thr_join(cpuw[i].t);
     cpu_n = 0;
+}
+
+/* ------------------------------------------------------------------ schede: una per thread, CUDA (NVIDIA) o OpenCL (AMD, Intel) */
+#define GPU_MAX 16
+typedef struct {
+    int kind;                    /* 0 CUDA, 1 OpenCL, 2 kernel sulla CPU (prove) */
+    int cuda_i;
+    ocl_info_t ocl;
+    char name[160];
+    cpuw_t w;
+    int state;                   /* 0 si apre, 1 mina, -1 esclusa */
+    unsigned batch;
+    unsigned long long hashes, h_stat;
+    gpu_t g;
+} gdev_t;
+static gdev_t gd[GPU_MAX];
+static int ngd;
+static struct { unsigned lines, batch, block; int tune; } GO;
+
+/* un lancio piccolo confrontato con la CPU (cpuh_hash: thread-safe) */
+static int gpu_check(gpu_t *g, unsigned batch)
+{
+    uint8_t h[80]; for (int i = 0; i < 80; i++) h[i] = (uint8_t)(i * 29 + 7);
+    unsigned n = batch < 1024 ? batch : 1024, bad = 0;
+    n = n / g->block * g->block; if (!n) n = g->block;
+    cpuh_t ch; if (cpuh_init(&ch, g->lines, 1)) return -1;
+    cpuh_job(&ch, h);
+    make_job(g, h, 0xFFFFFF00u, 0, 1);
+    if (launch(g, n)) { cpuh_free(&ch); return -1; }
+    for (unsigned t = 0; t < n; t += n / 16 ? n / 16 : 1) {
+        uint8_t ref[32], got[32]; cpuh_hash(&ch, 0xFFFFFF00u + t, ref);
+        for (int i = 0; i < 8; i++) { uint32_t w = g->hashes[(size_t)t * 8 + i]; got[4*i] = w >> 24; got[4*i+1] = w >> 16; got[4*i+2] = w >> 8; got[4*i+3] = (uint8_t)w; }
+        bad += memcmp(ref, got, 32) != 0;
+    }
+    cpuh_free(&ch);
+    return bad ? 1 : 0;
+}
+
+/* taratura degli hash in volo sulla scheda (fino a max): ritorna il migliore */
+static unsigned gpu_tune(gpu_t *g, unsigned max, const char *name)
+{
+    unsigned cand[] = { 256, 512, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384 }, best = 0;
+    double rbest = 0; uint8_t h[80] = {0}; uint32_t base = 0;
+    say("%s: taratura, hash in volo -> kH/s\n", name);
+    for (unsigned k = 0; k < sizeof cand / sizeof cand[0]; k++) {
+        unsigned n = cand[k] / g->block * g->block; if (n > max || n == 0 || (max >= 2048 && n < 1024)) continue;
+        make_job(g, h, base, 0, 0); if (launch(g, n)) return best; base += n;          /* riscaldamento */
+        double t0 = now_s(), dt; unsigned long long done = 0;
+        do { make_job(g, h, base, 0, 0); if (launch(g, n)) return best; base += n; done += n; dt = now_s() - t0; } while (dt < (g->kind == 2 ? 0.2 : 0.8));
+        say("  %s %6u  %7.1f\n", name, n, done / dt / 1e3);
+        if (done / dt > rbest * 1.005) { rbest = done / dt; best = n; }                 /* a parita' il piu' piccolo: meno memoria */
+    }
+    if (!best) return max;
+    gpu_shrink(g, best);
+    say("%s: taratura, scelgo %u hash in volo (%.1f kH/s). Per saltarla la prossima volta: --batch %u\n", name, best, rbest / 1e3, best);
+    return best;
+}
+
+static mtx_t gpu_open_lock;          /* le schede si aprono (e si tarano) una alla volta: messaggi in ordine, misure pulite */
+static void gpu_worker(void *arg)
+{
+    gdev_t *d = (gdev_t *)arg; gpu_t *g = &d->g;
+    int r;
+    mtx_lock(&gpu_open_lock);
+    gpu_cap = GO.tune ? 16384 : 8192;
+    if (d->kind == 1) r = gpu_open_ocl(g, &d->ocl, GO.lines, GO.tune ? 0 : GO.batch, GO.tune ? 16384 : 1u << 20);
+    else r = gpu_open(g, d->cuda_i, d->kind == 2, GO.lines, GO.tune ? 0 : GO.batch, kernel_ptx);
+    if (r) { say("%s: esclusa\n", d->name); mtx_unlock(&gpu_open_lock); __atomic_store_n(&d->state, -1, __ATOMIC_RELEASE); return; }
+    if (d->kind != 1 && GO.block) g->block = GO.block;
+    unsigned batch = (unsigned)(g->batch_alloc / g->block) * g->block;
+    if (GO.tune) batch = gpu_tune(g, batch, d->name);
+    int bad = gpu_check(g, batch);
+    say("%s: %u hash in volo (%.2f GiB), controllo del kernel contro la CPU: %s\n", d->name, batch, batch * (double)GO.lines * 128 / 1073741824.0,
+        bad ? "HASH DIVERSI: scheda esclusa" : "OK");
+    mtx_unlock(&gpu_open_lock);
+    if (bad) { __atomic_store_n(&d->state, -1, __ATOMIC_RELEASE); return; }
+    d->batch = batch;
+    __atomic_store_n(&d->state, 1, __ATOMIC_RELEASE);
+    for (;;) {
+        uint32_t start, gen; uint8_t hdr[80], tgt[32];
+        if (work_take(batch, &start, &gen, hdr, tgt)) { sleep_ms(10); continue; }      /* niente lavoro o nonce del job finiti */
+        uint64_t t64 = bp_top64(tgt);
+        make_job(g, hdr, start, t64, 0);
+        if (launch(g, batch)) { tsay("%s: errore nel lancio del kernel, la scheda si ferma", d->name); __atomic_store_n(&d->state, -1, __ATOMIC_RELEASE); return; }
+        __atomic_fetch_add(&d->hashes, (unsigned long long)batch, __ATOMIC_RELAXED);
+        if (g->found[0]) {
+            mtx_lock(&W.lock);
+            for (unsigned k = 0; k < g->found[0] && k < 255; k++) if (W.nq < 256) {
+                struct qent *e = &W.q[W.nq++]; e->gen = gen; e->nonce = g->found[1 + k]; e->src = (int)(d - gd); e->has_hash = 0; e->t64 = t64;
+            }
+            mtx_unlock(&W.lock);
+        }
+    }
+}
+
+static unsigned long long total_hashes(void)
+{
+    unsigned long long t = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED);
+    for (int k = 0; k < ngd; k++) t += __atomic_load_n(&gd[k].hashes, __ATOMIC_RELAXED);
+    return t;
+}
+/* tutte le schede: prima le NVIDIA con CUDA, poi le GPU OpenCL (le NVIDIA no, se c'e' CUDA) */
+static int gpu_enumerate(int use_cuda, int use_ocl, int shim)
+{
+    ngd = 0;
+    if (shim) { gd[0].kind = 2; snprintf(gd[0].name, sizeof gd[0].name, "kernel sulla CPU"); return ngd = 1; }
+    int ncuda = 0;
+    if (use_cuda) {
+        cuda_quiet = 1;
+        if (!cuda_load() && !cuInit(0) && !cuDeviceGetCount(&ncuda))
+            for (int i = 0; i < ncuda && ngd < GPU_MAX; i++) {
+                int dev = 0; char name[128] = "GPU NVIDIA";
+                if (!cuDeviceGet(&dev, i)) cuDeviceGetName(name, sizeof name, dev);
+                gd[ngd].kind = 0; gd[ngd].cuda_i = i; snprintf(gd[ngd].name, sizeof gd[ngd].name, "%s", name); ngd++;
+            }
+        else ncuda = 0;
+    }
+    if (use_ocl) {
+        ocl_info_t o[GPU_MAX];
+        int no = ocl_list(o, GPU_MAX, ncuda > 0);
+        for (int i = 0; i < no && ngd < GPU_MAX; i++) {
+            gd[ngd].kind = 1; gd[ngd].ocl = o[i]; snprintf(gd[ngd].name, sizeof gd[ngd].name, "%s", o[i].name); ngd++;
+        }
+    }
+    return ngd;
 }
 static int pool_send(const char *line);
 
@@ -452,15 +578,19 @@ static void submit(uint32_t nonce, const uint8_t hash[32])
 
 int main(int argc, char **argv)
 {
-    int dev_i = 0, cpu = 0;
-    unsigned lines = 4096, batch = 0, block = 128;
-    int tune = 0, tune_cpu = 0, use_gpu = 1, cpu_threads = 0, cpu_lanes = 3;
+    int shim = 0, use_cuda = 1, use_ocl = 1, list_only = 0;
+    const char *gpu_sel = "all";
+    unsigned lines = 4096, batch = 0, block = 0;
+    int tune = 0, tune_cpu = 0, cpu_only = 0, cpu_threads = 0, cpu_lanes = 3;
     double bench = 0, share_s = 10;
     M.host = "127.0.0.1"; M.port = 7340; M.user = NULL; M.s = SOCK_BAD;
     static char hostbuf[256];
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
-        if (!strcmp(a, "--gpu")) { dev_i = atoi(v); i++; }
+        if (!strcmp(a, "--gpu")) { gpu_sel = v; i++; }
+        else if (!strcmp(a, "--list-gpus")) list_only = 1;
+        else if (!strcmp(a, "--no-cuda")) use_cuda = 0;
+        else if (!strcmp(a, "--no-opencl")) use_ocl = 0;
         else if (!strcmp(a, "--batch")) { batch = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--block")) { block = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--lines")) { lines = (unsigned)atoi(v); i++; }
@@ -473,88 +603,88 @@ int main(int argc, char **argv)
             char *c = strrchr(hostbuf, ':'); if (c) { *c = 0; M.port = atoi(c + 1); }
             M.host = hostbuf; i++;
         }
-        else if (!strcmp(a, "--cpu-backend")) cpu = 1;
+        else if (!strcmp(a, "--cpu-backend")) shim = 1;
         else if (!strcmp(a, "--tune")) tune = 1;
         else if (!strcmp(a, "--tune-cpu")) tune_cpu = 1;
-        else if (!strcmp(a, "--no-gpu") || !strcmp(a, "--cpu-only")) use_gpu = 0;
+        else if (!strcmp(a, "--no-gpu") || !strcmp(a, "--cpu-only")) cpu_only = 1;
         else if (!strcmp(a, "--cpu")) { cpu_threads = !strcmp(v, "auto") ? -1 : atoi(v); i++; }
         else if (!strcmp(a, "--cpu-lanes")) { cpu_lanes = atoi(v); i++; }
         else if (!strcmp(a, "--diff")) { M.diff_hint = atof(v); i++; }
         else if (!strcmp(a, "--proto")) { M.proto = !strcmp(v, "aria") ? 2 : !strcmp(v, "stratum") ? 1 : 0; i++; }
         else {
-            printf("bound-gpuminer " VERSION "\n  --user INDIRIZZO.nome  [--pool HOST:PORTA] [--gpu N] [--batch N] [--block 128] [--tune] [--share-s 10]\n"
+            printf("bound-gpuminer " VERSION "\n  --user INDIRIZZO.nome  [--pool HOST:PORTA] [--gpu all|none|0,1,..] [--batch N] [--tune] [--share-s 10]\n"
                    "  --pool bound.ariabrain.com:3373   pool AriaPool (riconosciuto da solo; --proto aria|stratum per forzare, --diff N difficolta' chiesta)\n"
                    "  --pool IP_DEL_PC:7340             in solitaria sul proprio nodo, col ponte bound_bridge.py\n"
-                   "  --tune                 all'avvio misura quanti hash in volo rendono di piu' su questa scheda (10 s) e usa quel valore\n"
+                   "  --gpu all              tutte le GPU insieme (default): NVIDIA con CUDA, AMD e Intel (anche integrate) con OpenCL\n"
+                   "  --gpu 0,2              solo quelle schede (numeri di --list-gpus);  --gpu none: nessuna GPU\n"
+                   "  --list-gpus            elenca le schede trovate ed esce\n"
+                   "  --no-cuda / --no-opencl  non usare quel tipo di driver (con --no-cuda le NVIDIA vanno con OpenCL)\n"
+                   "  --batch N              hash in volo per scheda (default: automatico)\n"
+                   "  --tune                 all'avvio misura su ogni scheda quanti hash in volo rendono di piu' e usa quel valore\n"
                    "  --bench SECONDI        solo la velocita', senza rete\n"
-                   "  --cpu N|auto           mina anche con la CPU: N thread (auto = tutti i thread logici meno uno, per la GPU)\n"
-                   "  --cpu-lanes L          hash calcolati insieme da ogni thread CPU, 1..4 (default 3, il migliore misurato su Ryzen 7950X3D)\n"
+                   "  --cpu N|auto           mina anche con la CPU: N thread (auto = tutti i thread logici meno uno per ogni GPU)\n"
+                   "  --cpu-lanes L          hash calcolati insieme da ogni thread CPU, 1..4 (default 3)\n"
                    "  --tune-cpu             all'avvio prova varie combinazioni di thread e hash per thread (circa 40 s) e usa la migliore\n"
-                   "  --cpu-only             solo la CPU, anche senza scheda NVIDIA (uguale a --no-gpu); senza GPU utilizzabile\n"
-                   "                         il miner passa da solo alla CPU\n");
+                   "  --cpu-only             solo la CPU (uguale a --gpu none --cpu auto); senza GPU utilizzabili il miner passa da solo alla CPU\n");
             if (DEVFEE_PERCENT > 0) printf("\nDev fee: %d %% del tempo (%.0f s ogni %.0f minuti) il miner lavora per l'indirizzo dello sviluppatore\n" DEVFEE_ADDRESS "\n(si presenta al tuo ponte o al pool con quell'indirizzo). Il bench non ha fee.\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
             return 2;
         }
     }
-    logf = fopen("bound-gpuminer.log", "a");
-    say("bound-gpuminer " VERSION " - BOUND (BoundHash) su GPU NVIDIA e CPU\n");
+    if (!strcmp(gpu_sel, "none")) cpu_only = 1;
+    if (!list_only) logf = fopen("bound-gpuminer.log", "a");
+    say("bound-gpuminer " VERSION " - BOUND (BoundHash) su GPU (NVIDIA, AMD, Intel) e CPU\n");
+    if (list_only) {
+        int n = gpu_enumerate(use_cuda, use_ocl, 0);
+        if (!n) say("nessuna GPU trovata (driver NVIDIA per CUDA, driver AMD / Intel per OpenCL)\n");
+        for (int k = 0; k < n; k++) {
+            if (gd[k].kind == 0) say("  %d: %s  (NVIDIA, CUDA)\n", k, gd[k].name);
+            else say("  %d: %s  (%s, OpenCL, %u unita' di calcolo, %.0f MiB%s)\n", k, gd[k].name, gd[k].ocl.vendor, gd[k].ocl.cus,
+                     gd[k].ocl.gmem / 1048576.0, gd[k].ocl.unified ? ", integrata" : "");
+        }
+        say("CPU: %d thread logici\n", ncpu_logical());
+        return 0;
+    }
     if (DEVFEE_PERCENT > 0) say("dev fee %d %%: %.0f s ogni %.0f minuti il miner lavora per " DEVFEE_ADDRESS " (sul tuo ponte o pool)\n", DEVFEE_PERCENT, (double)(DEVFEE_CYCLE_S) * DEVFEE_PERCENT / 100.0, (double)(DEVFEE_CYCLE_S) / 60);
     else say("nessuna dev fee (build senza fee)\n");
     if (bp_selftest()) { say("selftest BoundHash sulla CPU FALLITO\n"); return 1; }
     if (bp_set_lines(lines)) return 1;
     if (!bench && !M.user) { say("manca --user INDIRIZZO_BOUND.nome (oppure --bench 20)\n"); return 2; }
-    batch = (batch / block) * block;
-    gpu_t g; memset(&g, 0, sizeof g);
-    if (use_gpu) {
-    /* senza --batch: 8192 hash in volo (il meglio misurato sulla RTX 4090) o quanti ne stanno in memoria; con --tune fino a 16384 */
-    gpu_cap = tune ? 16384 : 8192;
-    if (gpu_open(&g, dev_i, cpu, lines, tune ? 0 : batch, kernel_ptx)) {
-        if (cpu) return 1;
-        say("nessuna GPU NVIDIA utilizzabile (vedi sopra): mino solo con la CPU\n");
-        use_gpu = 0; goto no_gpu;
-    }
-    g.block = block; batch = (unsigned)(g.batch_alloc / block) * block;
-    if (tune) {
-        unsigned cand[] = { 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384 }, best = 0; double rbest = 0;
-        uint8_t h[80] = {0}; uint32_t base = 0;
-        say("taratura: hash in volo -> kH/s\n");
-        for (unsigned k = 0; k < sizeof cand / sizeof cand[0]; k++) {
-            unsigned n = cand[k] / block * block; if (n > batch || n == 0) continue;
-            make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n;         /* riscaldamento */
-            double t0 = now_s(), dt; unsigned long long done = 0;
-            do { make_job(&g, h, base, 0, 0); if (launch(&g, n)) return 1; base += n; done += n; dt = now_s() - t0; } while (dt < (cpu ? 0.2 : 0.8));
-            say("  %6u  %7.1f\n", n, done / dt / 1e3);
-            if (done / dt > rbest * 1.005) { rbest = done / dt; best = n; }             /* a parita' vince il piu' piccolo: meno VRAM */
-        }
-        if (best && best < batch && !cpu) {                                              /* tengo solo la memoria che serve */
-            cuMemFree(g.d_pad); CK(cuMemAlloc(&g.d_pad, (size_t)best * lines * 128));
-        }
-        if (best) batch = best;
-        say("taratura: scelgo %u hash in volo (%.1f kH/s). Per saltarla la prossima volta: --batch %u\n", batch, rbest / 1e3, batch);
-    }
-    say("%u hash in volo (%.1f GiB), %u thread per blocco\n", batch, batch * (double)lines * 128 / 1073741824.0, block);
+    mtx_init(&W.lock); mtx_init(&gpu_open_lock); W.lines = lines;
+    cpuh_engine();                                               /* costanti della CPU pronte prima dei thread */
+    GO.lines = lines; GO.batch = batch; GO.block = block; GO.tune = tune;
 
-    /* controllo iniziale: un lancio piccolo confrontato con la CPU */
-    {
-        uint8_t h[80]; for (int i = 0; i < 80; i++) h[i] = (uint8_t)(i * 29 + 7);
-        unsigned n = batch < 1024 ? batch : 1024, bad = 0;
-        make_job(&g, h, 0xFFFFFF00u, 0, 1);
-        if (launch(&g, n)) return 1;
-        for (unsigned t = 0; t < n; t += n / 16) {
-            uint8_t ref[32], got[32]; bp_hash_nonce(h, 0xFFFFFF00u + t, ref);
-            for (int i = 0; i < 8; i++) { uint32_t w = g.hashes[(size_t)t * 8 + i]; got[4*i] = w >> 24; got[4*i+1] = w >> 16; got[4*i+2] = w >> 8; got[4*i+3] = (uint8_t)w; }
-            bad += memcmp(ref, got, 32) != 0;
+    /* schede: si aprono una alla volta, ognuna nel suo thread (che poi mina) */
+    int ngpu = 0;
+    if (!cpu_only) {
+        gpu_enumerate(use_cuda, use_ocl, shim);
+        if (strcmp(gpu_sel, "all")) {                            /* --gpu 0,2 */
+            gdev_t keep[GPU_MAX]; int nk = 0;
+            for (const char *p = gpu_sel; *p; ) {
+                int k = atoi(p);
+                if (k >= 0 && k < ngd && nk < GPU_MAX) keep[nk++] = gd[k]; else say("la scheda %d non c'e' (--list-gpus)\n", k);
+                while (*p && *p != ',') p++;
+                if (*p == ',') p++;
+            }
+            memcpy(gd, keep, sizeof keep[0] * (size_t)nk); ngd = nk;
         }
-        say("controllo del kernel contro la CPU: %s\n", bad ? "HASH DIVERSI: non mino" : "OK");
-        if (bad) return 1;
+        if (!ngd) say("nessuna GPU trovata (driver NVIDIA per CUDA, driver AMD / Intel per OpenCL)\n");
+        for (int k = 0; k < ngd; k++) {
+            gd[k].w.fn = gpu_worker; gd[k].w.arg = &gd[k];
+            if (thr_start(&gd[k].w.t, &gd[k].w)) { gd[k].state = -1; continue; }
+            while (__atomic_load_n(&gd[k].state, __ATOMIC_ACQUIRE) == 0) sleep_ms(20);
+            if (gd[k].state == 1) ngpu++;
+        }
+        if (!ngpu) {
+            if (shim) return 1;
+            say("nessuna GPU utilizzabile: mino solo con la CPU\n");
+            cpu_only = 1;
+        }
     }
-    }   /* use_gpu */
-no_gpu:
-    mtx_init(&W.lock); W.lines = lines;
+
     if (tune_cpu && !cpu_threads) cpu_threads = -1;
-    if (!use_gpu && !cpu_threads) cpu_threads = -1;
+    if (cpu_only && !cpu_threads) cpu_threads = -1;
     int nlog = ncpu_logical();
-    if (cpu_threads < 0) cpu_threads = nlog > 1 ? nlog - (use_gpu ? 1 : 0) : 1;
+    if (cpu_threads < 0) cpu_threads = nlog - ngpu >= 1 ? nlog - ngpu : 1;
     if (cpu_threads > CPU_MAXT) cpu_threads = CPU_MAXT;
     if (cpu_lanes < 1) cpu_lanes = 1;
     if (cpu_lanes > CPUH_MAXLANES) cpu_lanes = CPUH_MAXLANES;
@@ -562,17 +692,18 @@ no_gpu:
         const char *eng = cpuh_engine();
         int st = cpuh_selftest(lines);
         say("CPU: %d thread logici, BoundHash %s, controllo contro il riferimento: %s\n", nlog, eng, st ? "HASH DIVERSI: CPU esclusa" : "OK");
-        if (st) { cpu_threads = 0; if (!use_gpu) return 1; }
+        if (st) { cpu_threads = 0; if (!ngpu) return 1; }
     }
     if (tune_cpu && cpu_threads) {
-        /* thread: meta' (un thread per core fisico se c'e' l'SMT), tutti meno uno, tutti; hash per thread: 1..4 */
-        int tc[3] = { nlog / 2, nlog - 1, nlog }, bt = 0, bl = 0; double best = 0;
+        /* thread: meta' (un thread per core fisico se c'e' l'SMT), tutti meno le GPU, tutti; hash per thread: 1..4.
+         * Le GPU stanno ferme durante la taratura (non c'e' lavoro pubblicato per loro: W.left e' tutto della CPU) */
+        int tc[3] = { nlog / 2, nlog - (ngpu ? ngpu : 1), nlog }, bt = 0, bl = 0; double best = 0;
         static uint8_t th[80];
         say("taratura CPU: thread x hash per thread -> kH/s\n");
-        mtx_lock(&W.lock); memset(W.target, 0, 32); memcpy(W.header, th, 80); W.next = 0; W.left = 1ull << 40; W.active = 1; mtx_unlock(&W.lock);
         for (int a = 0; a < 3; a++) {
             int t = tc[a]; if (t < 1 || (a && t == tc[a - 1])) continue;
             for (int l = 1; l <= CPUH_MAXLANES; l++) {
+                mtx_lock(&W.lock); memset(W.target, 0, 32); memcpy(W.header, th, 80); W.next = 0; W.left = 1ull << 40; W.active = 1; mtx_unlock(&W.lock);
                 cpu_start(t, l); sleep_ms(700);
                 unsigned long long h0 = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED); double t0 = now_s();
                 sleep_ms(2500);
@@ -582,38 +713,50 @@ no_gpu:
                 if (r > best * 1.015) { best = r; bt = t; bl = l; }      /* a parita' (entro 1,5 %%) vince la prima: meno thread e memoria */
             }
         }
-        work_off(); W.cpu_hashes = 0;                              /* il conteggio della taratura non va nelle medie */
+        work_off();
         if (bt) { cpu_threads = bt; cpu_lanes = bl; }
         say("taratura CPU: scelgo %d thread x %d hash (%.1f kH/s). Per saltarla la prossima volta: --cpu %d --cpu-lanes %d\n",
             cpu_threads, cpu_lanes, best / 1e3, cpu_threads, cpu_lanes);
     }
     if (cpu_threads) say("CPU: %d thread x %d hash insieme (%.1f MiB di scratchpad)%s\n", cpu_threads, cpu_lanes,
-                         cpu_threads * cpu_lanes * (double)lines * 128 / 1048576.0, use_gpu ? ", a priorita' bassa: la GPU ha la precedenza" : "");
-    if (!use_gpu) batch = 0;
+                         cpu_threads * cpu_lanes * (double)lines * 128 / 1048576.0, ngpu ? ", a priorita' bassa: le GPU hanno la precedenza" : "");
+    unsigned need = 0;                                            /* nonce per un giro di tutte le schede */
+    for (int k = 0; k < ngd; k++) if (gd[k].state == 1) need += gd[k].batch;
+    if (need < 4096) need = 4096;
+
+    /* velocita' di ogni parte: "X kH/s = GPU0 a + GPU1 b + CPU c" */
+    #define PARTS(buf, dt, upd) do { \
+        char *pp_ = buf; buf[0] = 0; int np_ = 0; \
+        for (int k_ = 0; k_ < ngd; k_++) if (gd[k_].state == 1) { \
+            unsigned long long h_ = __atomic_load_n(&gd[k_].hashes, __ATOMIC_RELAXED); \
+            pp_ += sprintf(pp_, "%s GPU%d %.1f", np_++ ? " +" : " =", k_, (h_ - gd[k_].h_stat) / (dt) / 1e3); \
+            if (upd) gd[k_].h_stat = h_; } \
+        if (cpu_threads) { unsigned long long h_ = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED); \
+            pp_ += sprintf(pp_, "%s CPU %.1f", np_++ ? " +" : " =", (h_ - cpu_stat) / (dt) / 1e3); if (upd) cpu_stat = h_; } \
+        if (np_ == 1) { char lb_[24]; const char *s_ = buf + 3; int n_ = 0; while (s_[n_] && s_[n_] != ' ' && n_ < 20) { lb_[n_] = s_[n_]; n_++; } \
+                        lb_[n_] = 0; sprintf(buf, " (%s)", lb_); } \
+    } while (0)
+    unsigned long long cpu_stat = 0;
+    #define TOTAL() total_hashes()
 
     double t_start = now_s(), t_stat = t_start, t_retry = 0;
-    unsigned long long hashes = 0, h_stat = 0;
     if (bench > 0) {
-        uint8_t h[80] = {0}; uint32_t base = 0x80000000u;          /* GPU nella meta' alta dei nonce, CPU in quella bassa */
-        if (cpu_threads) {
-            mtx_lock(&W.lock); memset(W.target, 0, 32); memset(W.header, 0, 80); W.next = 0; W.left = 0x80000000u; W.active = 1; mtx_unlock(&W.lock);
-            cpu_start(cpu_threads, cpu_lanes);
-        }
-        unsigned long long c0 = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED); t_start = now_s();
-        while (now_s() - t_start < bench) {
-            if (use_gpu) { make_job(&g, h, base, 0, 0); if (launch(&g, batch)) return 1; base += batch; hashes += batch; }
-            else sleep_ms(50);
-        }
-        double dt = now_s() - t_start, cr = (__atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED) - c0) / dt;
-        if (cpu_threads) cpu_stop();
-        say("bench: %.0f H/s (%.1f kH/s) in %.0f s", (hashes / dt) + cr, (hashes / dt + cr) / 1e3, dt);
-        if (cpu_threads && use_gpu) say("  =  GPU %.1f kH/s + CPU %.1f kH/s", hashes / dt / 1e3, cr / 1e3);
-        else if (cpu_threads) say("  (CPU)");
-        say("\n");
-        return 0;
+        mtx_lock(&W.lock); memset(W.target, 0, 32); memset(W.header, 0, 80); W.next = 0; W.left = 0xFFFFFFFFull; W.active = 1; W.gen++; mtx_unlock(&W.lock);
+        if (cpu_threads) cpu_start(cpu_threads, cpu_lanes);
+        sleep_ms(500);                                            /* tutti al lavoro prima di misurare */
+        unsigned long long t0h = TOTAL();
+        for (int k = 0; k < ngd; k++) gd[k].h_stat = __atomic_load_n(&gd[k].hashes, __ATOMIC_RELAXED);
+        cpu_stat = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED);
+        t_start = now_s();
+        while (now_s() - t_start < bench) sleep_ms(100);
+        double dt = now_s() - t_start; char parts[512];
+        unsigned long long tot = TOTAL() - t0h;
+        PARTS(parts, dt, 0);
+        say("bench: %.0f H/s (%.1f kH/s) in %.0f s%s\n", tot / dt, tot / dt / 1e3, dt, parts);
+        fflush(NULL);
+        _exit(0);                                                 /* i thread delle schede non hanno un'uscita pulita */
     }
     if (cpu_threads) cpu_start(cpu_threads, cpu_lanes);
-    unsigned long long cpu_stat = 0;
     net_init();
     M.suggest = 0;                          /* dopo la prima misura: una share ogni share_s secondi */
     double fee_next = now_s() + DEVFEE_FIRST_S, fee_end = 0;
@@ -641,38 +784,27 @@ no_gpu:
             if (M.newjob || !M.awork.valid) { new_work(); work_publish(); }
         } else {
             if (!(M.subscribed && M.authorized && M.job.valid && M.diff > 0)) { work_off(); sleep_ms(20); continue; }
-            if (M.newjob || !M.work.valid || work_left() < (batch ? batch : 4096)) { new_work(); work_publish(); }
+            if (M.newjob || !M.work.valid || work_left() < need) { new_work(); work_publish(); }
         }
         mtx_lock(&W.lock); memcpy(W.target, M.share_target, 32); mtx_unlock(&W.lock);    /* la difficolta' puo' cambiare a meta' job */
-        /* share della CPU: ricontrollate e mandate se l'header e' ancora quello */
+        /* nonce trovati da GPU e CPU: ricontrollati qui e mandati se l'header e' ancora quello */
         {
-            struct { uint32_t gen, nonce; uint8_t hash[32]; } q[64]; int nq;
+            static struct qent q[256]; int nq;
             mtx_lock(&W.lock); nq = W.nq; memcpy(q, W.q, sizeof q[0] * (size_t)nq); W.nq = 0; uint32_t cur = W.gen; mtx_unlock(&W.lock);
             for (int k = 0; k < nq; k++) {
                 if (q[k].gen != cur) continue;                                       /* header cambiato: share vecchia */
                 uint8_t hh[32]; bp_hash_nonce(M.header, q[k].nonce, hh);
-                if (memcmp(hh, q[k].hash, 32)) { M.hw++; tsay("ERRORE: la CPU ha dato un hash sbagliato (%08x)", q[k].nonce); continue; }
-                if (!bp_le256_le(hh, M.share_target)) continue;
+                if (q[k].has_hash && memcmp(hh, q[k].hash, 32)) { M.hw++; tsay("ERRORE: la CPU ha dato un hash sbagliato (%08x)", q[k].nonce); continue; }
+                if (!q[k].has_hash && bp_top64(hh) > q[k].t64) {
+                    M.hw++; tsay("ERRORE: %s (GPU%d) ha dato un nonce sbagliato (%08x)", gd[q[k].src].name, q[k].src, q[k].nonce); continue;
+                }
+                if (!bp_le256_le(hh, M.share_target)) continue;                      /* sotto i 64 bit alti ma sopra il target intero */
                 M.found++; submit(q[k].nonce, hh);
             }
         }
-        if (use_gpu) {
-            uint32_t start, gen;
-            if (work_take(batch, &start, &gen, NULL, NULL)) { sleep_ms(M.aria ? 50 : 5); continue; }   /* nonce del job finiti: aspetto il prossimo */
-            make_job(&g, M.header, start, bp_top64(M.share_target), 0);
-            if (launch(&g, batch)) return 1;
-            hashes += batch;
-            for (unsigned k = 0; k < g.found[0] && k < 255; k++) {
-                uint8_t hh[32]; uint32_t nonce = g.found[1 + k];
-                bp_hash_nonce(M.header, nonce, hh);                       /* ogni nonce ricontrollato sulla CPU */
-                if (bp_top64(hh) > bp_top64(M.share_target)) { M.hw++; tsay("ERRORE: la GPU ha dato un nonce sbagliato (%08x)", nonce); continue; }
-                if (!bp_le256_le(hh, M.share_target)) continue;           /* sotto i 64 bit alti ma sopra il target intero */
-                if (gen != __atomic_load_n(&W.gen, __ATOMIC_RELAXED)) continue;
-                M.found++; submit(nonce, hh);
-            }
-        } else sleep_ms(20);
+        sleep_ms(10);
         double t = now_s();
-        unsigned long long all = hashes + __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED);
+        unsigned long long all = TOTAL();
         if (!M.aria && M.suggest == 0 && t - t_start > 3) {                      /* difficolta' sulla velocita' vera */
             char b[128];
             M.suggest = (all / (t - t_start)) * share_s / 4294967296.0;
@@ -680,14 +812,15 @@ no_gpu:
             pool_send(b);
         }
         if (t - t_stat >= 10) {
-            unsigned long long ch = __atomic_load_n(&W.cpu_hashes, __ATOMIC_RELAXED);
-            char parts[96] = "";
-            if (cpu_threads && use_gpu) snprintf(parts, sizeof parts, " = GPU %.1f + CPU %.1f", (hashes - h_stat) / (t - t_stat) / 1e3, (ch - cpu_stat) / (t - t_stat) / 1e3);
-            else if (cpu_threads) snprintf(parts, sizeof parts, " (CPU)");
-            tsay("%.1f kH/s%s (media %.1f) | share %llu accettate (dev fee %llu), %llu rifiutate, %llu vecchie | errori %llu%s",
-                 (hashes - h_stat + ch - cpu_stat) / (t - t_stat) / 1e3, parts, all / (t - t_start) / 1e3, M.accepted, M.fee_accepted,
-                 M.rejected, M.stale, M.hw, M.fee ? " | dev fee in corso" : "");
-            t_stat = t; h_stat = hashes; cpu_stat = ch;
+            static unsigned long long all_stat;
+            char parts[512];
+            double dt = t - t_stat;
+            PARTS(parts, dt, 1);
+            int dead = 0; for (int k = 0; k < ngd; k++) dead += gd[k].state == -1 && gd[k].batch;
+            tsay("%.1f kH/s%s (media %.1f) | share %llu accettate (dev fee %llu), %llu rifiutate, %llu vecchie | errori %llu%s%s",
+                 (all - all_stat) / dt / 1e3, parts, all / (t - t_start) / 1e3, M.accepted, M.fee_accepted,
+                 M.rejected, M.stale, M.hw, dead ? " | una GPU si e' fermata" : "", M.fee ? " | dev fee in corso" : "");
+            t_stat = t; all_stat = all;
         }
     }
 }

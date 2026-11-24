@@ -31,6 +31,10 @@ $Z cc  $W -std=gnu99 -O2 -w -c src/third_party/cJSON.c -o /tmp/w_cj.o
 $Z c++ $W -O2 -s -static -o dist/bound-gpubench.exe /tmp/w_gb.o /tmp/w_bk.o /tmp/w_bp.o
 $Z c++ $W -O2 -s -static -o dist/bound-gpuminer.exe /tmp/w_gm.o /tmp/w_ch.o /tmp/w_cj.o /tmp/w_bk.o /tmp/w_bp.o -lws2_32
 ls -la dist
+# kernel OpenCL (AMD, Intel): src/kernel_cl.h e' bound_kernel.cu come stringa:  python3 tools/make_cl.py
+# prova del kernel OpenCL (anche senza GPU, con POCL: apt install pocl-opencl-icd ocl-icd-libopencl1):
+#   gcc -O2 -Isrc tools/test_ocl.c src/bound_pow.c -ldl -o /tmp/test_ocl && BOUND_OPENCL_CPU=1 /tmp/test_ocl 4096 128
+# piu' schede finte con una: BOUND_OPENCL_CPU=1 BOUND_OPENCL_DUP=2 E2E_REAL_GPU=1 MINER=... python3 tools/e2e_pool.py 25 --cpu 1
 # file .bat del pacchetto Windows: scripts/   script .sh del pacchetto Linux: scripts_linux/
 # prova del protocollo AriaPool senza GPU:  MINER=dist/bound-gpuminer python3 tools/e2e_pool.py [S] [--cpu 2 | --no-gpu --cpu 2]
 # prova completa senza GPU (serve boundd con la patch):

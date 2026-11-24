@@ -6,7 +6,8 @@
 // indirizzo casuale dello scratchpad del thread. Il limite e' la banda della VRAM (circa 2,1 MB per hash).
 //
 // Lo stesso sorgente si compila come C++ per la CPU (-DCPU_SHIM): e' cosi' che il kernel viene verificato
-// bit a bit contro bound_pow.c senza una GPU.
+// bit a bit contro bound_pow.c senza una GPU. E si compila anche come OpenCL C (__OPENCL_VERSION__, dal driver
+// della scheda a runtime): e' il kernel per le GPU AMD e Intel, dedicate e integrate.
 //
 // job[0..7]   midstate SHA-256 dopo tag||tag e i primi 64 byte dell'header
 // job[8..10]  byte 64..75 dell'header come 3 parole big-endian
@@ -20,7 +21,27 @@
 #define FOR16(OP) OP(0) OP(1) OP(2) OP(3) OP(4) OP(5) OP(6) OP(7) OP(8) OP(9) OP(10) OP(11) OP(12) OP(13) OP(14) OP(15)
 #define FOR8(OP) OP(0) OP(1) OP(2) OP(3) OP(4) OP(5) OP(6) OP(7)
 
-#ifdef CPU_SHIM
+#if defined(__OPENCL_VERSION__)
+typedef ulong u64;
+typedef uint u32;
+#define DEV inline
+#define GMEM __global
+#define mulhi64(a, b) mul_hi((ulong)(a), (ulong)(b))
+#define MULW(a, b) upsample(mul_hi((uint)(a), (uint)(b)), (uint)(a) * (uint)(b))
+#define LD2_(k) { ulong2 a_ = q_[k]; dst_[2 * k] = a_.x; dst_[2 * k + 1] = a_.y; }
+#define ST2_(k) { ulong2 a_; a_.x = src_[2 * k]; a_.y = src_[2 * k + 1]; q_[k] = a_; }
+#define LOAD_LINE(dst, ptr)  do { u64 *dst_ = (dst); __global const ulong2 *q_ = (__global const ulong2 *)(ptr); FOR8(LD2_) } while (0)
+#define STORE_LINE(ptr, src) do { const u64 *src_ = (src); __global ulong2 *q_ = (__global ulong2 *)(ptr); FOR8(ST2_) } while (0)
+__constant u32 SHA_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#elif defined(CPU_SHIM)
 typedef unsigned long long u64;
 typedef unsigned int u32;
 #define DEV static inline
@@ -30,6 +51,7 @@ static inline u64 mulhi64(u64 a, u64 b) { return (u64)(((unsigned __int128)a * b
 #define ST1_(k) ptr_[k] = src_[k];
 #define LOAD_LINE(dst, ptr)  do { u64 *dst_ = (dst); const u64 *ptr_ = (ptr); FOR16(LD1_) } while (0)
 #define STORE_LINE(ptr, src) do { u64 *ptr_ = (ptr); const u64 *src_ = (src); FOR16(ST1_) } while (0)
+#define GMEM
 #else
 typedef unsigned long long u64;
 typedef unsigned int u32;
@@ -48,6 +70,7 @@ __device__ __forceinline__ u64 mulw_(u32 a, u32 b)
 #define ST2_(k) { ulonglong2 a_; a_.x = src_[2 * k]; a_.y = src_[2 * k + 1]; q_[k] = a_; }
 #define LOAD_LINE(dst, ptr)  do { u64 *dst_ = (dst); const ulonglong2 *q_ = (const ulonglong2 *)(ptr); FOR8(LD2_) } while (0)
 #define STORE_LINE(ptr, src) do { const u64 *src_ = (src); ulonglong2 *q_ = (ulonglong2 *)(ptr); FOR8(ST2_) } while (0)
+#define GMEM
 #endif
 #define FOUND_MAX 255
 #define RR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
@@ -55,6 +78,9 @@ __device__ __forceinline__ u64 mulw_(u32 a, u32 b)
 
 DEV void sha_compress(u32 st[8], u32 w[16])
 {
+#if defined(__OPENCL_VERSION__)
+#define K SHA_K
+#else
     const u32 K[64] = {
         0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
         0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -64,6 +90,7 @@ DEV void sha_compress(u32 st[8], u32 w[16])
         0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
         0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
         0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#endif
     u32 a = st[0], b = st[1], c = st[2], d = st[3], e = st[4], f = st[5], g = st[6], h = st[7];
     for (int i = 0; i < 64; i++) {
         u32 wi;
@@ -78,6 +105,7 @@ DEV void sha_compress(u32 st[8], u32 w[16])
         h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
     st[0] += a; st[1] += b; st[2] += c; st[3] += d; st[4] += e; st[5] += f; st[6] += g; st[7] += h;
+#undef K
 }
 
 #define ROTR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
@@ -92,7 +120,7 @@ DEV void sha_compress(u32 st[8], u32 w[16])
 #define PXV_(k) p[k] ^= v[k];
 #define VEP_(k) v[k] = p[k];
 // un hash: thread t, scratchpad M (lines x 16 parole). Ritorna 1 se sta sotto il target; h = digest (8 parole BE)
-DEV int bound_thread(u32 t, u64 *M, const u32 *job, u32 h[8])
+DEV int bound_thread(u32 t, GMEM u64 *M, const u32 *job, u32 h[8])
 {
     const u32 L = job[14];
     const u32 nonce = job[11] + t;
@@ -140,7 +168,7 @@ DEV int bound_thread(u32 t, u64 *M, const u32 *job, u32 h[8])
     FOR16(OP_)
 #undef OP_
     for (u32 r = 0; r < L; r++) {
-        u64 *line = M + (u64)((u32)v[0] & (L - 1)) * 16;
+        GMEM u64 *line = M + (u64)((u32)v[0] & (L - 1)) * 16;
         LOAD_LINE(p, line);
 #define OP_(k) v[k] ^= p[k];
         FOR16(OP_)
@@ -178,7 +206,20 @@ DEV int bound_thread(u32 t, u64 *M, const u32 *job, u32 h[8])
     return hi < job[12] || (hi == job[12] && lo <= job[13]);
 }
 
-#ifdef CPU_SHIM
+#if defined(__OPENCL_VERSION__)
+__kernel void bound_kernel(__global u64 *pad, __global const u32 *job, __global u32 *found, __global u32 *out_hash)
+{
+    const u32 t = (u32)get_global_id(0);
+    u32 lj[24];
+    for (int i = 0; i < 24; i++) lj[i] = job[i];
+    u32 h[8];
+    if (bound_thread(t, pad + (u64)t * lj[14] * 16, lj, h)) {
+        u32 n = atomic_inc(found);
+        if (n < FOUND_MAX) found[1 + n] = lj[11] + t;
+    }
+    if (lj[15] & 1) for (int i = 0; i < 8; i++) out_hash[(u64)t * 8 + i] = h[i];
+}
+#elif defined(CPU_SHIM)
 extern "C" void bound_cpu_launch(u64 *pad, const u32 *job, u32 *found, u32 *out_hash, u32 nthreads)
 {
     for (u32 t = 0; t < nthreads; t++) {

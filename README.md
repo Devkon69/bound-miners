@@ -50,6 +50,14 @@ detects it by itself. The protocol as observed is written down in `gpu/tools/moc
 tests. `--tune` measures at start-up how many hashes in flight give the best rate on your card (the default, 8192, is
 the best value measured on an RTX 4090).
 
+**AMD, Intel and several GPUs (from 0.6).** NVIDIA cards run with CUDA, AMD and Intel GPUs (also the graphics integrated
+in the processor) with OpenCL, loaded at run time from the card's driver. By default the miner uses every GPU it finds,
+each in its own thread, together with the CPU (`--cpu auto`); all of them take nonces from one shared counter. `--list-gpus`
+lists them, `--gpu 0,2` picks some, `--no-cuda` runs NVIDIA cards through OpenCL. The OpenCL kernel is the same source as
+the CUDA one (`src/bound_kernel.cu`, `__OPENCL_VERSION__` branch), compiled by the driver at start-up and checked against
+the CPU; it gives the reference hashes on an OpenCL CPU implementation (POCL) but **has not run on a real AMD or Intel GPU
+yet**.
+
 **GPU + CPU (from 0.5).** `--cpu auto` adds CPU threads next to the GPU (all logical CPUs but one), `--cpu-only` mines with
 the CPU alone, also on a PC without an NVIDIA card (without a usable GPU the miner falls back to the CPU by itself). Launch
 scripts for the three modes: `avvia_pool*.bat` on Windows, `avvia_pool*.sh` on Linux. Measured with an RTX 4090 and a

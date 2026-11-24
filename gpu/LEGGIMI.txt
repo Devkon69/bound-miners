@@ -1,5 +1,7 @@
-bound-gpuminer 0.5.1 - miner GPU NVIDIA e CPU per BOUND (BoundHash), Windows e Linux - 23/11/2026
-=================================================================================================
+bound-gpuminer 0.6 - miner GPU (NVIDIA, AMD, Intel) e CPU per BOUND (BoundHash), Windows e Linux - 24/11/2026
+==========================================================================================================
+NOVITA' 0.6: GPU AMD e Intel, dedicate e INTEGRATE (OpenCL), e PIU' SCHEDE INSIEME, anche di marche diverse, insieme
+alla CPU. Di default il miner usa tutte le GPU che trova (--gpu all). Vedi "PIU' GPU, AMD E INTEL" sotto.
 NOVITA' 0.5.1: modalita' SOLO CPU con il suo file di avvio (avvia_pool_cpu.bat / avvia_pool_cpu.sh); se non trova una
 GPU NVIDIA utilizzabile il miner passa da solo alla CPU invece di fermarsi; script .sh per Linux per tutti i modi.
 NOVITA' 0.5: puo' minare ANCHE CON LA CPU, insieme alla GPU (--cpu) o da sola (--no-gpu). Senza --cpu mina solo
@@ -43,6 +45,22 @@ Cosa si vede
   *** BLOCCO N ACCETTATO.  "errori GPU" deve restare 0: ogni nonce e' ricalcolato sulla CPU prima di mandarlo.
   Tutto finisce anche in bound-gpuminer.log.
 
+PIU' GPU, AMD E INTEL (0.6)
+  Le NVIDIA vanno con CUDA (il driver NVIDIA basta); AMD e Intel, comprese le grafiche integrate nei processori, vanno
+  con OpenCL, che arriva col driver della scheda (AMD Adrenalin, Intel Graphics): non serve installare altro. Ogni scheda
+  ha il suo thread e prende i nonce dallo stesso contatore della CPU, quindi nessuna prova lo stesso nonce di un'altra.
+    elenca_gpu.bat / ./elenca_gpu.sh     elenca le schede trovate, con il numero di ognuna
+    --gpu all                            tutte (default)          --gpu 0,2     solo quelle          --gpu none   nessuna
+    --no-cuda                            le NVIDIA con OpenCL invece che con CUDA (piu' lento, solo per prova)
+  La riga ogni 10 s mostra ogni parte:   612.4 kH/s = GPU0 350.8 + GPU1 48.1 + CPU 213.5
+  Il kernel OpenCL viene compilato dal driver all'avvio (qualche secondo, una volta per scheda) e controllato contro la
+  CPU: se una scheda da' hash sbagliati viene esclusa e le altre continuano. --tune tara ogni scheda per conto suo.
+  Le integrate usano la RAM del sistema (al piu' 1 GiB) e dividono consumo e calore con la CPU: possono togliere alla CPU
+  piu' di quanto rendono. Confronta con bench.bat (tutto) e bench.bat --gpu 0 (solo la prima scheda); se conviene
+  lasciarla fuori, scrivi --gpu e i numeri delle schede da usare negli script di avvio.
+  Stato: il kernel OpenCL da' gli stessi hash del riferimento (provato con un'implementazione OpenCL su CPU); NON E' ANCORA
+  STATO PROVATO SU UNA SCHEDA AMD O INTEL VERA. Per provarlo su una NVIDIA: bench.bat --no-cuda.
+
 TRE MODI DI MINARE (stessi file su Windows .bat e su Linux .sh)
   solo GPU      avvia_pool.bat         / ./avvia_pool.sh
   GPU + CPU     avvia_pool_gpu_cpu.bat / ./avvia_pool_gpu_cpu.sh     (--cpu auto: tutti i thread meno uno)
@@ -78,7 +96,8 @@ Opzioni
   --cpu N|auto     mina anche con la CPU: N thread (auto = tutti i thread logici meno uno)
   --cpu-lanes L    hash calcolati insieme da ogni thread CPU, 1..4 (default 3)
   --tune-cpu       all'avvio prova 3 numeri di thread x 1..4 hash (circa 40 s) e usa la combinazione migliore
-  --cpu-only       solo la CPU (anche su un PC senza scheda NVIDIA); uguale a --no-gpu
+  --cpu-only       solo la CPU (anche su un PC senza scheda video); uguale a --gpu none
+  --gpu X          all (default) | none | 0,1,...    --list-gpus  elenca le schede    --no-cuda / --no-opencl
   --block N        thread per blocco (default 128)
   --share-s S      secondi tra le share (default 10)
   --bench S        solo la velocita'

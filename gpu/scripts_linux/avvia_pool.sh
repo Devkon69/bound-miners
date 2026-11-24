@@ -1,5 +1,5 @@
 #!/bin/sh
-# solo GPU NVIDIA. Metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO; pc1 = nome di questo PC.
+# solo GPU (tutte quelle trovate: NVIDIA, AMD, Intel). Metti il tuo indirizzo BOUND al posto di TUO_INDIRIZZO; pc1 = nome di questo PC.
 cd "$(dirname "$0")"
 UTENTE=TUO_INDIRIZZO.pc1
 POOL=bound.ariabrain.com:3373
